@@ -68,9 +68,9 @@ MIN_RELOAD_S = 10          # re-read the CSV at most this often, and only when i
 REFRESH_MS = 30_000        # browsers poll this often; a tab only re-renders when its data/image changed
 MAX_IMAGE_WIDTH = 1600     # images are scaled down to this width before being sent
 
-# The BME280's temperature reads several °C high (heated or failing sensor); hidden until the
-# board is replaced. Its humidity and pressure are still shown.
-SHOW_BME280_TEMPERATURE = False
+# Show the BME280 temperature next to the MCP9808 (chart and summary table). It was hidden from
+# mid-2026 while the old BME280 read several °C high; the new sensor fitted 2026-11-08 works.
+SHOW_BME280_TEMPERATURE = True
 # The Gemini nowcast tab is hidden for now; set to True to bring it back.
 SHOW_NOWCAST_TAB = False
 
