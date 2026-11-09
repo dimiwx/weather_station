@@ -18,7 +18,7 @@ TAIL_BYTES = 1_200_000           # ~6 days of CSV at the current ~185 KB/day; on
 LOOKBACK = timedelta(days=2)     # rain since Athens midnight needs the gauge readings from before it
 FRESH = timedelta(minutes=15)    # older readings count as missing
 WIND_WINDOW = timedelta(minutes=10)
-INCLUDE_BME280 = False           # set True once the BME280 board is replaced (humidity, pressure)
+INCLUDE_BME280 = True            # BME280 humidity and pressure (new sensor, data since 2026-11-09)
 
 # CSV columns (0 = timestamp, UTC)
 COL_HUMIDITY, COL_PRESSURE, COL_LIGHT = 2, 3, 4

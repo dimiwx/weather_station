@@ -7,8 +7,8 @@ One run = one upload, using the AWEKAS API (data.awekas.at/eingabe_pruefung.php)
 Credentials come from .env: AWEKAS_USERNAME and AWEKAS_PASSWORD (sent as an MD5 hash).
 
 The values come from station_now.py (shared with ~/upload_WU.py): the MCP9808 temperature, rain since
-Athens midnight, 10-minute wind (mean, strongest reading as the gust, vector-mean direction), UV and light.
-Not sent: humidity and pressure (station_now.INCLUDE_BME280), PM (the PMSA003I needs cleaning).
+Athens midnight, 10-minute wind (mean, strongest reading as the gust, vector-mean direction), UV, light,
+and the BME280's humidity and pressure (station_now.INCLUDE_BME280). Not sent: PM (the PMSA003I needs cleaning).
 
   python3 upload_awekas.py            upload, and append one line to awekas.log
   python3 upload_awekas.py --dry-run  print what would be sent, without uploading
