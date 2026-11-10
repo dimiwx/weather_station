@@ -212,6 +212,8 @@ IMAGE_SOURCES = {
     "sounding": ("upper_air_soundings/16622_sounding_*.png", "PNG"),        # observed, Thessaloniki airport
     "sounding-model": ("upper_air_soundings/16622_model_*.png", "PNG"),     # GFS profile, Thessaloniki airport
     "sounding-sofia": ("upper_air_soundings/15614_sounding_*.png", "PNG"),  # observed, Sofia (fallback)
+    "sounding-athens": ("upper_air_soundings/16716_sounding_*.png", "PNG"), # observed, Athens Hellinikon (12Z)
+    "sounding-larissa": ("upper_air_soundings/16648_model_*.png", "PNG"),   # GFS profile, Larissa (no radiosonde)
     "forecast": ("7-day_forecast/Kalamaria_forecast.png", "PNG"),
 }
 _image_cache = {}
@@ -307,13 +309,17 @@ def sounding_figure(name, caption):
 
 
 def sounding_tab():
-    """The observed Thessaloniki sounding while it is current; otherwise the GFS profile and Sofia."""
+    """The observed Thessaloniki sounding while it is current (otherwise the GFS profile and Sofia), then
+    the GFS profile for Larissa (no radiosonde there) and the newest observed Athens sounding."""
+    larissa = sounding_figure("sounding-larissa", "GFS model profile, Larissa (not observed)")
+    athens = sounding_figure("sounding-athens", "Observed sounding, Athens Hellinikon (16716)")
     obs_path, _ = latest_image("sounding")
     obs_valid = sounding_valid_time(obs_path) if obs_path else None
     now_utc = datetime.now(ZoneInfo("UTC"))
     if obs_valid and now_utc - obs_valid <= timedelta(hours=SOUNDING_FALLBACK_AFTER_HOURS):
-        return html.Div(sounding_figure("sounding", "Observed sounding, Thessaloniki airport (16622)"),
-                        style={"display": "flex", "justifyContent": "center"})
+        figures = [f for f in (sounding_figure("sounding", "Observed sounding, Thessaloniki airport (16622)"),
+                               larissa, athens) if f is not None]
+        return html.Div(figures, style={"display": "flex", "flexWrap": "wrap", "justifyContent": "center"})
 
     since = f"since {obs_valid:%d %b %Y %H}Z" if obs_valid else "for now"
     note = html.Div(
@@ -324,7 +330,8 @@ def sounding_tab():
                "borderRadius": "6px"}
     )
     figures = [f for f in (sounding_figure("sounding-model", "GFS model profile, Thessaloniki airport (not observed)"),
-                           sounding_figure("sounding-sofia", "Observed sounding, Sofia (15614)")) if f is not None]
+                           sounding_figure("sounding-sofia", "Observed sounding, Sofia (15614)"), larissa, athens)
+               if f is not None]
     if not figures:
         figures = [html.Div("No sounding available at the moment.", style={"textAlign": "center", "padding": "20px"})]
     return html.Div([note, html.Div(figures, style={"display": "flex", "flexWrap": "wrap", "justifyContent": "center"})])
@@ -1048,7 +1055,7 @@ IMAGE_TABS = {
     "Temperature Anomaly": ("anomaly", "Latest 850 hPa temperature anomaly map", "No temperature anomaly map found."),
     "7 Day Forecast": ("forecast", "7-day forecast for Kalamaria", "7-day forecast image not found."),
 }
-SOUNDING_IMAGES = ["sounding", "sounding-model", "sounding-sofia"]
+SOUNDING_IMAGES = ["sounding", "sounding-model", "sounding-sofia", "sounding-athens", "sounding-larissa"]
 STATION_PHOTO = os.path.join(BASE_DIR, "assets", "station_photo.jpg")
 
 # Satellite animation: process_image.py keeps 1600-px frames named <YYYYmmddHHMM>.jpg (image time, UTC)

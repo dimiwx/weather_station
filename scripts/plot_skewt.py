@@ -1,59 +1,137 @@
+import matplotlib
+matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import glob
+import io
 import os
 
+import requests
 import metpy.calc as mpcalc
 from metpy.cbook import get_test_data
 from metpy.plots import SkewT
 from metpy.units import units
 from metpy.interpolate import interpolate_1d
-from siphon.simplewebservice.wyoming import WyomingUpperAir
+
+
+UWYO_URL = "https://weather.uwyo.edu/wsgi/sounding"
+# How far back to look for the newest sounding. Thessaloniki usually launches at 00Z (sometimes 06Z too),
+# but on roughly 1 day in 10 there is no sounding in the archive at all.
+LOOKBACK_HOURS = 72
+
+
+def fetch_uwyo_sounding(dt, station_id):
+    """
+    Fetches one sounding as CSV from the University of Wyoming service and returns it with the
+    column names siphon's WyomingUpperAir used. siphon < 0.11 still calls the retired cgi-bin
+    interface (404 since late June 2026), and siphon 0.11 needs Python >= 3.11.
+    """
+    params = {"datetime": dt.strftime("%Y-%m-%d %H:%M:%S"), "id": station_id,
+              "type": "TEXT:CSV", "src": "UNKNOWN"}
+    resp = requests.get(UWYO_URL, params=params, timeout=60)
+    if resp.status_code != 200:
+        raise ValueError(f"HTTP {resp.status_code}: {resp.text.strip()[:120]}")
+
+    raw = pd.read_csv(io.StringIO(resp.text), skipinitialspace=True)
+    # High-resolution soundings (Athens sends ~2-s samples) repeat or briefly reverse the pressure, and
+    # MetPy needs it strictly decreasing: keep a row only if its pressure is below every earlier one.
+    p = raw['pressure_hPa'].values
+    raw = raw[p < np.fmin.accumulate(np.r_[np.inf, p[:-1]])].reset_index(drop=True)
+    speed = raw['wind speed_m/s'].values * units('m/s')
+    direction = raw['wind direction_degree'].values * units.degree
+    u, v = mpcalc.wind_components(speed, direction)
+    return pd.DataFrame({
+        'pressure': raw['pressure_hPa'],
+        'height': raw['geopotential height_m'],
+        'temperature': raw['temperature_C'],
+        'dewpoint': raw['dew point temperature_C'],
+        'u_wind': u.to('knots').magnitude,
+        'v_wind': v.to('knots').magnitude,
+    })
+
+
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+# GFS pressure levels from the surface up to 100 hPa (the top of the plot)
+MODEL_LEVELS_HPA = [1000, 975, 950, 925, 900, 850, 800, 750, 700, 650, 600, 550, 500,
+                    450, 400, 350, 300, 250, 200, 150, 100]
+MODEL_VARIABLES = ["temperature", "dew_point", "wind_speed", "wind_direction", "geopotential_height"]
+
+
+def fetch_model_profile(dt, lat, lon, elevation_m, model="gfs_seamless"):
+    """
+    Model profile on pressure levels for one hour from Open-Meteo, with the same columns as
+    fetch_uwyo_sounding. Levels below the ground (when surface pressure is under 1000 hPa) are dropped.
+    """
+    params = {"latitude": lat, "longitude": lon, "models": model, "wind_speed_unit": "kn",
+              "timezone": "UTC", "past_days": 1, "forecast_days": 1,
+              "hourly": ",".join(f"{v}_{p}hPa" for v in MODEL_VARIABLES for p in MODEL_LEVELS_HPA)}
+    resp = requests.get(OPEN_METEO_URL, params=params, timeout=60)
+    resp.raise_for_status()
+    hourly = resp.json()["hourly"]
+    i = hourly["time"].index(dt.strftime("%Y-%m-%dT%H:%M"))
+
+    rows = []
+    for p in MODEL_LEVELS_HPA:
+        t, td, speed, direction, z = (hourly[f"{v}_{p}hPa"][i] for v in MODEL_VARIABLES)
+        if None in (t, td, speed, direction, z) or z < elevation_m:
+            continue
+        rows.append((p, z, t, td, speed, direction))
+    if len(rows) < 5:
+        raise ValueError(f"only {len(rows)} usable model levels")
+    raw = pd.DataFrame(rows, columns=["pressure", "height", "temperature", "dewpoint", "speed", "direction"])
+    u, v = mpcalc.wind_components(raw["speed"].values * units.knots, raw["direction"].values * units.degree)
+    return pd.DataFrame({
+        'pressure': raw['pressure'],
+        'height': raw['height'],
+        'temperature': raw['temperature'],
+        'dewpoint': raw['dewpoint'],
+        'u_wind': u.to('knots').magnitude,
+        'v_wind': v.to('knots').magnitude,
+    })
+
+
+def find_newest_sounding(station_id, save_dir):
+    """
+    The newest available observed sounding for a station: every 6-hourly launch time over the last
+    LOOKBACK_HOURS, newest first. Returns (time, data), (time, None) when that sounding is already
+    plotted, or (None, None) when there is none.
+    """
+    now_utc = datetime.now(timezone.utc)
+    newest_slot = now_utc.replace(hour=now_utc.hour - now_utc.hour % 6, minute=0, second=0, microsecond=0)
+    for dt in [newest_slot - timedelta(hours=6 * i) for i in range(LOOKBACK_HOURS // 6 + 1)]:
+        # Reaching a sounding that is already plotted means nothing newer is available: stop, so
+        # frequent runs cost only a few requests and the plot's file time stays its first-plotted time.
+        if os.path.exists(os.path.join(save_dir, f"{station_id}_sounding_{dt:%Y%m%d_%H%M}.png")):
+            print(f"Newest available sounding for {station_id} ({dt:%Y-%m-%d %H}Z) is already plotted. Nothing new.")
+            return dt, None
+        try:
+            print(f"Attempting to fetch data for station {station_id} for {dt:%Y-%m-%d %H:%M}Z...")
+            df = fetch_uwyo_sounding(dt, station_id)
+            print(f"Data fetched successfully for {dt:%Y-%m-%d %H:%M}Z.")
+            return dt, df
+        except Exception as e:
+            print(f"-> No data available for {dt:%Y-%m-%d %H}Z ({type(e).__name__}: {e}). Trying next available time.")
+    print(f"No sounding available for {station_id} in the last {LOOKBACK_HOURS} hours.")
+    return None, None
 
 
 def plot_skewt_for_station(station_id, station_name_long, save_dir):
-    """
-    Fetches the latest upper-air data for a given station ID, prioritizing 06Z
-    and falling back to 00Z. It then calculates thermodynamic properties
-    and instability indices, and plots a Skew-T diagram with an information box.
+    """Plots the station's newest observed sounding unless it is already plotted; returns its time or None."""
+    dt, df = find_newest_sounding(station_id, save_dir)
+    if df is not None:
+        plot_sounding(df, station_name_long, dt, os.path.join(save_dir, f"{station_id}_sounding_{dt:%Y%m%d_%H%M}.png"))
+    return dt
 
-    Args:
-        station_id (str): The WMO station identifier (e.g., '16622' for LGTS).
-        station_name_long (str): The full name for the plot title.
-        save_dir (str): The directory where the plot will be saved.
+
+def plot_sounding(df, station_name_long, time_val, filepath):
+    """
+    Calculates thermodynamic properties and instability indices from a profile (columns pressure,
+    height, temperature, dewpoint, u_wind, v_wind in knots; surface first) and saves a Skew-T
+    diagram with an information box.
     """
     try:
-        # ### MODIFICATION START ###
-        # --- 1. & 2. Set Time and Request Data (with fallback logic) ---
-        now_utc = datetime.now(timezone.utc)
-        # Define the hours to try in order of preference
-        hours_to_try = [6, 0] 
-        df = None # Initialize dataframe to None
-        
-        for hour in hours_to_try:
-            try:
-                # Set the target datetime for the current attempt
-                dt = now_utc.replace(hour=hour, minute=0, second=0, microsecond=0)
-                print(f"Attempting to fetch data for station {station_id} for {dt:%Y-%m-%d %H:%M}Z...")
-
-                # Request data for the specified time
-                df = WyomingUpperAir().request_data(time=dt, site_id=station_id)
-                
-                # If the request succeeds, we have our data.
-                print(f"Data fetched successfully for {dt:%Y-%m-%d %H:%M}Z.")
-                break # Exit the loop since we found data
-                
-            except Exception:
-                # If it fails, print a message. The loop will try the next hour.
-                print(f"-> No data available for {hour:02d}Z. Trying next available time.")
-        
-        # If the loop finished and df is still None, no data was found for any time.
-        if df is None:
-            print("Could not retrieve data for 06Z or 00Z. No plot will be generated.")
-            return # Exit the function cleanly
-        # ### MODIFICATION END ###
-
         # --- 3. Prepare Data for MetPy ---
         # Extract the necessary columns and assign units.
         p = df['pressure'].values * units.hPa
@@ -71,10 +149,6 @@ def plot_skewt_for_station(station_id, station_name_long, save_dir):
         u = u[valid_mask]
         v = v[valid_mask]
         height = height[valid_mask] # Apply mask to height as well
-
-        # Get the time from the dataframe's attributes for the title
-        # The 'dt' from the successful fetch is used as the valid time
-        time_val = dt
 
         print(f"Processing data for {station_name_long} at {time_val:%Y-%m-%d %H:%M}Z.")
         
@@ -106,45 +180,39 @@ def plot_skewt_for_station(station_id, station_name_long, save_dir):
         lfc_pressure, lfc_temperature = mpcalc.lfc(p_for_lfc, T_for_lfc, Td_for_lfc, which='most_cape')
         el_pressure, el_temperature = mpcalc.el(p_for_lfc, T_for_lfc, Td_for_lfc, which='most_cape')
 
+        # Interpolate height data to find the AGL height of LCL, LFC, and EL
+        lcl_height = np.nan * units.meter
+        lfc_height = np.nan * units.meter
+        el_height = np.nan * units.meter
+
+        if np.isfinite(lcl_pressure):
+            lcl_height = interpolate_1d(lcl_pressure, p, height)[0]
+        if np.isfinite(lfc_pressure):
+            lfc_height = interpolate_1d(lfc_pressure, p, height)[0]
+        if np.isfinite(el_pressure):
+            el_height = interpolate_1d(el_pressure, p, height)[0]
+
         # --- 4a. Calculate Additional Instability Indices ---
         print("Calculating instability indices...")
         indices = {}
         
-        # ### MODIFICATION START: LIFTED-INDEX CALCULATION ###
         # Lifted Index
         try:
-            # Use the same robust data preparation as the K-Index to ensure we use
-            # all available temperature data, ignoring any gaps in dewpoint data.
             p_full = df['pressure'].values * units.hPa
             T_full = df['temperature'].values * units.degC
             valid_T_mask = ~np.isnan(p_full.magnitude) & ~np.isnan(T_full.magnitude)
             p_for_interp = p_full[valid_T_mask]
             T_for_interp = T_full[valid_T_mask]
-
-            # Recalculate the parcel profile using the full pressure column for temperature.
-            # This ensures the parcel path extends as high as the temperature data does.
             parcel_prof_full = mpcalc.parcel_profile(p_for_interp, sfc_temperature, sfc_dewpoint)
-
-            # Define target pressure
             p_500 = 500 * units.hPa
-
-            # Interpolate environmental temperature at 500 hPa from the full T profile.
-            # We add [0] to extract the single value from the array returned by interpolate_1d.
             t_500 = interpolate_1d(p_500, p_for_interp, T_for_interp)[0]
-
-            # Interpolate parcel temperature at 500 hPa from the full parcel profile.
             parcel_t_500 = interpolate_1d(p_500, p_for_interp, parcel_prof_full)[0]
-
-            # Calculate Lifted Index. The units library correctly handles degC - degC = delta_degC.
             li_val = t_500 - parcel_t_500
-
             indices['Lifted Index'] = f'Lifted Index: {li_val.to("delta_degC").magnitude:.2f} °C'
             print("Lifted Index calculated successfully.")
-
         except Exception as e:
             indices['Lifted Index'] = 'Lifted Index: N/A'
             print(f"Could not calculate Lifted Index. Error: {e}")
-        # ### MODIFICATION END ###
 
         # Showalter Index
         try:
@@ -153,57 +221,32 @@ def plot_skewt_for_station(station_id, station_name_long, save_dir):
         except Exception:
             indices['Showalter Index'] = 'Showalter Index: N/A'
 
-        # ### MODIFICATION START: K-INDEX CALCULATION ###
-        # K Index - Interpolate to required levels to avoid 'N/A'
+        # K Index
         try:
-            # We need T at 850, 700, 500 hPa and Td at 850, 700 hPa.
-            # T data is often available higher up than Td data. We will handle them
-            # separately to ensure we use all available data.
-
-            # Prepare data for Temperature interpolation (only requires valid P and T)
             p_full = df['pressure'].values * units.hPa
             T_full = df['temperature'].values * units.degC
             valid_T_mask = ~np.isnan(p_full.magnitude) & ~np.isnan(T_full.magnitude)
             p_for_T_interp = p_full[valid_T_mask]
             T_for_T_interp = T_full[valid_T_mask]
-
-            # Prepare data for Dewpoint interpolation (requires valid P, T, and Td)
             Td_full = df['dewpoint'].values * units.degC
             valid_Td_mask = ~np.isnan(p_full.magnitude) & ~np.isnan(T_full.magnitude) & ~np.isnan(Td_full.magnitude)
             p_for_Td_interp = p_full[valid_Td_mask]
             Td_for_Td_interp = Td_full[valid_Td_mask]
-
-            # Interpolate temperatures.
             p_req_T = np.array([850, 700, 500]) * units.hPa
             T_req = interpolate_1d(p_req_T, p_for_T_interp, T_for_T_interp)
             T850, T700, T500 = T_req[0], T_req[1], T_req[2]
-
-            # Interpolate dewpoints.
             p_req_Td = np.array([850, 700]) * units.hPa
             Td_req = interpolate_1d(p_req_Td, p_for_Td_interp, Td_for_Td_interp)
             Td850, Td700 = Td_req[0], Td_req[1]
-
-            # **FIX for units**: Extract magnitudes for calculation to avoid unit conflicts.
-            t850_m = T850.magnitude
-            t500_m = T500.magnitude
-            td850_m = Td850.magnitude
-            t700_m = T700.magnitude
-            td700_m = Td700.magnitude
-
-            # Perform calculation on raw numbers
+            t850_m, t500_m = T850.magnitude, T500.magnitude
+            td850_m, t700_m, td700_m = Td850.magnitude, T700.magnitude, Td700.magnitude
             k_val_mag = (t850_m - t500_m) + td850_m - (t700_m - td700_m)
-
-            # Re-attach the final, correct unit for an index
             k_val = k_val_mag * units.delta_degC
-
             indices['K Index'] = f'K Index: {k_val.to("delta_degC").magnitude:.2f} °C'
             print("K-Index calculated successfully.")
-
         except Exception as e:
-            # This block will now only be entered if data is truly missing within the required layers.
             indices['K Index'] = 'K Index: N/A'
-            print(f"Could not calculate K-Index, likely due to missing data within the 850-700 hPa layer. Error: {e}")
-        # ### MODIFICATION END ###
+            print(f"Could not calculate K-Index. Error: {e}")
             
         # Total Totals Index
         try:
@@ -234,22 +277,33 @@ def plot_skewt_for_station(station_id, station_name_long, save_dir):
 
         skew.plot(p, T, 'r', linewidth=2, label='Temperature')
         skew.plot(p, Td, 'g', linewidth=2, label='Dewpoint')
-        skew.plot_barbs(p[::5], u[::5], v[::5], y_clip_radius=0.03)
+        # Every level's wind barb, except for high-resolution soundings (thousands of levels), which
+        # get one barb per 25 hPa
+        if len(p) > 100:
+            idx = np.unique(mpcalc.resample_nn_1d(p.m, np.arange(1000, 99, -25)))
+            skew.plot_barbs(p[idx], u[idx], v[idx], y_clip_radius=0.03)
+        else:
+            skew.plot_barbs(p, u, v, y_clip_radius=0.03)
         skew.plot(p, parcel_prof, 'k', linewidth=2, linestyle='--', label='Parcel Path')
 
         skew.shade_cin(p, T, parcel_prof, Td, alpha=0.2, color='blue')
         skew.shade_cape(p, T, parcel_prof, alpha=0.2, color='red')
         
         if np.isfinite(lcl_pressure):
-             skew.plot(lcl_pressure, lcl_temperature, 'ko', markerfacecolor='black', label='LCL')
+            label_lcl = f'LCL: {lcl_pressure.m:.0f} hPa, {lcl_height.to("m").m:.0f} m'
+            skew.plot(lcl_pressure, lcl_temperature, 'ko', markerfacecolor='black', label=label_lcl)
         if np.isfinite(lfc_pressure):
-             skew.plot(lfc_pressure, lfc_temperature, 'bo', markerfacecolor='blue', label='LFC')
+            label_lfc = f'LFC: {lfc_pressure.m:.0f} hPa, {lfc_height.to("m").m:.0f} m'
+            skew.plot(lfc_pressure, lfc_temperature, 'bo', markerfacecolor='blue', label=label_lfc)
         if np.isfinite(el_pressure):
-             skew.plot(el_pressure, el_temperature, 'ro', markerfacecolor='red', label='EL')
+            label_el = f'EL: {el_pressure.m:.0f} hPa, {el_height.to("m").m:.0f} m'
+            skew.plot(el_pressure, el_temperature, 'ro', markerfacecolor='red', label=label_el)
 
         skew.plot_dry_adiabats(alpha=0.25)
         skew.plot_moist_adiabats(alpha=0.25)
         skew.plot_mixing_lines(alpha=0.25)
+
+        skew.ax.axvline(0, color='c', linestyle='--', linewidth=2)
 
         # --- 6. Finalize the Plot ---
         skew.ax.set_ylim(1050, 100)
@@ -274,7 +328,6 @@ def plot_skewt_for_station(station_id, station_name_long, save_dir):
             f'{indices.get("0-6km Bulk Shear", "0-6km Bulk Shear: N/A")}'
         )
         
-        # ### MODIFICATION START: MOVE TEXT BOX ###
         # Place text box in the upper-left corner of the plot axes
         skew.ax.text(0.02, 0.98, indices_text,
                      transform=skew.ax.transAxes,
@@ -282,23 +335,15 @@ def plot_skewt_for_station(station_id, station_name_long, save_dir):
                      horizontalalignment='left',
                      fontsize=10,
                      bbox=dict(boxstyle='round', facecolor='white', alpha=0.75))
-        # ### MODIFICATION END ###
 
         skew.ax.legend()
         plt.grid(True)
 
-        # --- 7. Save and Show the Plot ---
-        os.makedirs(save_dir, exist_ok=True)
-        date_str = time_val.strftime('%Y%m%d_%H%M')
-        # Updated filename to reflect the station ID
-        filename = f"{station_id}_sounding_{date_str}.png"
-        filepath = os.path.join(save_dir, filename)
-
+        # --- 7. Save the Plot ---
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         plt.savefig(filepath, bbox_inches='tight')
+        plt.close(fig)
         print(f"Plot saved to: {filepath}")
-        
-        plt.show()
-        print("Plot displayed.")
 
     except Exception as e:
         # This will catch errors in plotting or data processing *after* a successful download
@@ -306,12 +351,64 @@ def plot_skewt_for_station(station_id, station_name_long, save_dir):
 
 
 # --- Main execution ---
+SAVE_DIR = '/home/dimitris/weather_station/upper_air_soundings'
+# Without an observed Thessaloniki sounding for this long, also plot the fallbacks.
+# The dashboard (timeseries_plotly_optimised.py, SOUNDING_FALLBACK_AFTER_HOURS) uses the same rule.
+FALLBACK_AFTER_HOURS = 36
+THESSALONIKI_LAT, THESSALONIKI_LON, THESSALONIKI_ELEVATION_M = 40.52, 22.97, 4
+LARISSA_LAT, LARISSA_LON, LARISSA_ELEVATION_M = 39.65, 22.47, 73   # Larissa airport (LGLR), 107 km SW
+LARISSA_MODEL_KEEP = 8   # Larissa's GFS plots (one per 6 h) are pruned to the newest 8; soundings are all kept
+
+
+def plot_model_profile(file_id, place, lat, lon, elevation_m, slot, save_dir):
+    """Plots the GFS profile at `slot` as <file_id>_model_<YYYYmmdd_HHMM>.png unless it already exists."""
+    path = os.path.join(save_dir, f"{file_id}_model_{slot:%Y%m%d_%H%M}.png")
+    if os.path.exists(path):
+        print(f"GFS profile for {place} at {slot:%Y-%m-%d %H}Z is already plotted.")
+        return
+    try:
+        df = fetch_model_profile(slot, lat, lon, elevation_m)
+        plot_sounding(df, f'{place} (GFS model, not observed)', slot, path)
+    except Exception as e:
+        print(f"GFS profile for {place} not available: {type(e).__name__}: {e}")
+
+
+def prune_plots(save_dir, pattern, keep):
+    """Deletes all but the newest `keep` plots matching pattern (their names end in the valid time)."""
+    for path in sorted(glob.glob(os.path.join(save_dir, pattern)))[:-keep]:
+        os.remove(path)
+        print(f"Deleted old plot {os.path.basename(path)}")
+
+
+def main(save_dir=SAVE_DIR):
+    now_utc = datetime.now(timezone.utc)
+    slot = now_utc.replace(hour=now_utc.hour - now_utc.hour % 6, minute=0, second=0, microsecond=0)
+
+    # 1. Always look for the real Thessaloniki airport sounding first (WMO 16622)
+    thessaloniki_dt = plot_skewt_for_station('16622', 'Thessaloniki International Airport (LGTS)', save_dir)
+
+    # 2. Athens Hellinikon (16716), 301 km S, usually launches at 12Z
+    plot_skewt_for_station('16716', 'Athens Hellinikon (16716), 301 km S of Thessaloniki', save_dir)
+
+    # 3. Larissa has no radiosonde in the WMO network (not in NOAA's IGRA2 list, nothing at Wyoming for
+    #    16648), so plot the GFS profile for Larissa airport at the latest 6-hourly time instead. The file
+    #    name uses Larissa's WMO surface-station number, 16648.
+    plot_model_profile('16648', 'Larissa', LARISSA_LAT, LARISSA_LON, LARISSA_ELEVATION_M, slot, save_dir)
+    prune_plots(save_dir, "16648_model_*.png", LARISSA_MODEL_KEEP)
+
+    if thessaloniki_dt is not None and now_utc - thessaloniki_dt <= timedelta(hours=FALLBACK_AFTER_HOURS):
+        return
+
+    print(f"No observed Thessaloniki sounding in the last {FALLBACK_AFTER_HOURS} h: "
+          f"plotting the GFS model profile for Thessaloniki and the nearest observed sounding (Sofia).")
+
+    # 4. GFS model profile for Thessaloniki airport at the latest 6-hourly time
+    plot_model_profile('16622', 'Thessaloniki', THESSALONIKI_LAT, THESSALONIKI_LON, THESSALONIKI_ELEVATION_M,
+                       slot, save_dir)
+
+    # 5. Nearest radiosonde station that still reports: Sofia, 239 km north
+    plot_skewt_for_station('15614', 'Sofia (15614), 239 km N of Thessaloniki', save_dir)
+
+
 if __name__ == '__main__':
-    # WMO ID for Thessaloniki, Makedonia Airport is 16622
-    thessaloniki_station_id = '16622'
-    station_full_name = 'Thessaloniki International Airport (LGTS)'
-    # Define the directory to save the sounding plot
-    # Make sure this path is correct for your system
-    save_directory = '/home/dimitris/weather_station/upper_air_soundings'
-    
-    plot_skewt_for_station(thessaloniki_station_id, station_full_name, save_directory)
+    main()
