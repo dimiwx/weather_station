@@ -1,4 +1,4 @@
-import os, glob, base64, json
+import os, glob, base64, json, io
 from dotenv import load_dotenv
 
 # Load environment variables from the .env file
@@ -23,42 +23,48 @@ bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
 CSV_PATH = "/home/dimitris/weather_station/weather_station_data.csv"
 
-def load_all_data():
-    """Load the entire CSV (no 24-hour filter) and localize timestamps as UTC."""
-    try:
-        df = pd.read_csv(
-            CSV_PATH,
-            parse_dates=["timestamp"],
-            date_format="%Y-%m-%d %H:%M:%S",
-            low_memory=False,
-            on_bad_lines="skip"
-        )
-        df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
-        return df
-    except Exception as e:
-        print("Error loading data:", e)
-        return pd.DataFrame()
+# The whole CSV is ~33 MB and parsing it took ~6 s per call, so only its end is read: a day is ~130 KB.
+TAIL_START_BYTES = 512_000  # ~4 days; doubled until the window reaches back far enough
 
-def load_data():
-    """For event-based checks: load the last 24 hours of data."""
+
+def load_data_since(since_utc):
+    """
+    Rows dated from `since_utc` on, with timestamps as UTC and the sensor columns numeric, parsed from the
+    end of the CSV only. The window doubles until its oldest row is an hour older than `since_utc`
+    (rows from different writers aren't strictly in time order), or covers the whole file.
+    """
     try:
-        df = pd.read_csv(
-            CSV_PATH,
-            parse_dates=["timestamp"],
-            date_format="%Y-%m-%d %H:%M:%S",
-            low_memory=False,
-            on_bad_lines="skip"
-        )
+        since_naive = since_utc.astimezone(timezone.utc).replace(tzinfo=None)
+        size = os.path.getsize(CSV_PATH)
+        with open(CSV_PATH, "rb") as f:
+            header = f.readline()
+            window = TAIL_START_BYTES
+            while True:
+                start = max(len(header), size - window)
+                f.seek(start)
+                chunk = f.read()
+                if start > len(header):
+                    chunk = chunk[chunk.find(b"\n") + 1:]  # the first line is cut
+                df = pd.read_csv(io.BytesIO(header + chunk), dtype={"timestamp": str},
+                                 low_memory=False, on_bad_lines="skip")
+                df["timestamp"] = pd.to_datetime(df["timestamp"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+                df = df.dropna(subset=["timestamp"])
+                if start <= len(header) or (not df.empty and df["timestamp"].min() <= since_naive - timedelta(hours=1)):
+                    break
+                window *= 2
         df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
-        now_utc = datetime.now(ZoneInfo("UTC"))
-        threshold = now_utc - timedelta(hours=24)
-        df = df[df["timestamp"] >= threshold]
+        df = df[df["timestamp"] >= since_utc]
         numeric_cols = [col for col in df.columns if col not in ["timestamp", "Lightning Detection (AS3935)", "Rain Event (LM393)"]]
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
         return df
     except Exception as e:
         print("Error loading data:", e)
         return pd.DataFrame()
+
+
+def load_data():
+    """For event-based checks: the last 24 hours of data."""
+    return load_data_since(datetime.now(timezone.utc) - timedelta(hours=24))
 
 # ------------------------------
 # Notification Functions
@@ -71,11 +77,11 @@ def check_min_temp_notification(today_date):
     """
     now_utc = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
     if now_utc.hour == 7 and now_utc.minute < 5:
-        df = load_all_data()
+        midnight_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        df = load_data_since(midnight_utc)
         # SAFETY CHECK: Ensure data and timestamp column exist
         if df.empty or "timestamp" not in df.columns:
             return None
-        midnight_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
         df_today = df[df["timestamp"] >= midnight_utc]
         if df_today.empty or "Temperature (MCP9808) (°C)" not in df_today.columns:
             return None
@@ -92,11 +98,11 @@ def check_max_temp_notification(today_date):
     """
     now_utc = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
     if now_utc.hour == 15 and now_utc.minute < 5:
-        df = load_all_data()
+        midnight_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        df = load_data_since(midnight_utc)
         # SAFETY CHECK: Ensure data and timestamp column exist
         if df.empty or "timestamp" not in df.columns:
             return None
-        midnight_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
         df_today = df[df["timestamp"] >= midnight_utc]
         if df_today.empty or "Temperature (MCP9808) (°C)" not in df_today.columns:
             return None

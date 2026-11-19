@@ -49,6 +49,14 @@ CSV_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},")
 # Routine non-CSV output that isn't worth logging (the UV board's per-cycle debug and file-health lines)
 ROUTINE_LINE_RE = re.compile(r"^(Time: |LOG HEALTH: )")
 
+# The MCP9808 reads exactly 0.00 when the temperature board's I2C bus glitches (10 times from April to
+# November 2026, each right after 11-28 °C). Such a reading is left out when the last accepted MCP9808
+# reading (or, without a recent one, the BME280 temperature in the same row) is at least
+# ZERO_GLITCH_JUMP away from 0, so genuine readings near 0 °C on a cold night are kept.
+MCP_FIELD, BME_TEMP_FIELD = 8, 1   # positions in the temperature board's CSV row
+ZERO_GLITCH_JUMP = 2.0             # °C
+ZERO_GLITCH_REF_S = 20 * 60        # how recent the last accepted reading must be to compare with
+
 RETRY_S = 10              # wait between attempts to reopen a port after an error
 PORT_CHECK_S = 3          # how often to look for other programs on the ports
 ROW_GAP_LOG_S = 300       # log when a board sends no CSV row for longer than this
@@ -123,6 +131,32 @@ class Reader(threading.Thread):
         self.last_row = None            # time.monotonic() of the last CSV row written
         self.lines_since_row = 0
         self.other_since_row = 0
+        self.last_mcp = None            # (time.monotonic(), value) of the last accepted MCP9808 reading
+
+    def filter_zero_glitch(self, parts):
+        """Blanks an MCP9808 reading of exactly 0.00 that is a bus glitch (see ZERO_GLITCH_JUMP)."""
+        if len(parts) <= MCP_FIELD or not parts[MCP_FIELD].strip():
+            return
+        try:
+            value = float(parts[MCP_FIELD])
+        except ValueError:
+            return
+        now = time.monotonic()
+        if value == 0.0:
+            ref = None
+            if self.last_mcp and now - self.last_mcp[0] <= ZERO_GLITCH_REF_S:
+                ref, source = self.last_mcp[1], "the previous MCP9808 reading"
+            elif parts[BME_TEMP_FIELD].strip():
+                try:
+                    ref, source = float(parts[BME_TEMP_FIELD]), "the BME280 in the same row"
+                except ValueError:
+                    pass
+            if ref is not None and abs(ref) >= ZERO_GLITCH_JUMP:
+                parts[MCP_FIELD] = ""
+                log_event(f"[{self.label}] MCP9808 read 0.00 while {source} was {ref:.2f} °C: "
+                          "a bus glitch, value left out of the CSV")
+                return
+        self.last_mcp = (now, value)
 
     def report(self, problem):
         if problem != self.problem:
@@ -194,6 +228,7 @@ class Reader(threading.Thread):
                 self.no_clock = False
 
             parts[0] = convert_athens_to_utc(ts_local, self.input_tz, self.output_tz)
+            self.filter_zero_glitch(parts)
             out_line = ",".join(parts)
             self.append(out_line)
             print(f"[{self.label}] {out_line}", flush=True)
