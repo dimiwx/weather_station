@@ -156,6 +156,27 @@ def _read_recent_rows(size):
 
     numeric_cols = [c for c in df.columns if c != "timestamp" and c not in TEXT_COLS]
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+    return drop_zero_glitches(df)
+
+
+# The temperature board's I2C bus glitches make the MCP9808 read exactly 0.00 (12 times from 2025 to
+# 2026-11-19, each straight after 11-28 °C). The USB logger leaves these out since 2026-11-19 12:13 local;
+# this hides the older ones (and any that slip through): a reading of exactly 0 is dropped when the
+# sensor's last non-zero reading is at least ZERO_GLITCH_JUMP from 0, so genuine 0 °C readings stay.
+ZERO_GLITCH_JUMP = 2.0
+ZERO_GLITCH_COLS = [COL_T_MCP, COL_T_BME]
+
+
+def drop_zero_glitches(df):
+    """df sorted by time; blanks the glitch readings in place and returns df."""
+    for col in ZERO_GLITCH_COLS:
+        if col not in df.columns:
+            continue
+        readings = df[col].dropna()
+        last_nonzero = readings.where(readings != 0).ffill().shift(1)
+        glitches = readings.index[(readings == 0) & (last_nonzero.abs() >= ZERO_GLITCH_JUMP)]
+        if len(glitches):
+            df.loc[glitches, col] = np.nan
     return df
 
 
