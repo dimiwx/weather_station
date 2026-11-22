@@ -63,7 +63,11 @@ def strip_garbage(line):
         return None
     return row, len(prefix)
 # Routine non-CSV output that isn't worth logging (the UV board's per-cycle debug and file-health lines)
-ROUTINE_LINE_RE = re.compile(r"^(Time: |LOG HEALTH: )")
+ROUTINE_LINE_RE = re.compile(r"^(Time: |LOG HEALTH: |PAD )")
+# What is left of a routine line once a corrupted packet has eaten its start: the temperature board's padding
+# (dashes, since 2026-11-22) or the end of the UV board's debug line. Counted, and reported once an hour.
+ROUTINE_FRAGMENT_RE = re.compile(r"^(PAD )?-*$|RawV: ")
+CORRUPTION_REPORT_S = 3600
 
 # The MCP9808 reads exactly 0.00 when the temperature board's I2C bus glitches (10 times from April to
 # November 2026, each right after 11-28 °C). Such a reading is left out when the last accepted MCP9808
@@ -148,6 +152,8 @@ class Reader(threading.Thread):
         self.lines_since_row = 0
         self.other_since_row = 0
         self.last_mcp = None            # (time.monotonic(), value) of the last accepted MCP9808 reading
+        self.absorbed = 0               # corrupted packets that only hit a routine line, since the last report
+        self.absorbed_since = time.monotonic()
 
     def filter_zero_glitch(self, parts):
         """Blanks an MCP9808 reading of exactly 0.00 that is a bus glitch (see ZERO_GLITCH_JUMP)."""
@@ -227,8 +233,19 @@ class Reader(threading.Thread):
                     log_event(f"[{self.label}] row recovered from behind {garbage} garbage bytes: {line[:80]!r}")
             if not CSV_TS_RE.match(line):
                 self.other_since_row += 1
-                if not ROUTINE_LINE_RE.match(line):
+                rest = line.lstrip("�")
+                if ROUTINE_LINE_RE.match(line):
+                    pass
+                elif rest != line and ROUTINE_FRAGMENT_RE.search(rest):
+                    self.absorbed += 1
+                else:
                     log_event(f"[{self.label}] not a CSV row: {line[:200]!r}")
+                now = time.monotonic()
+                if now - self.absorbed_since >= CORRUPTION_REPORT_S:
+                    if self.absorbed:
+                        log_event(f"[{self.label}] {self.absorbed} corrupted packets hit only routine lines in the "
+                                  f"last {(now - self.absorbed_since) / 3600:.1f} h (no data lost)")
+                    self.absorbed, self.absorbed_since = 0, now
                 if self.keep_bad:
                     self.append(f"# [{self.label}] {line}")
                 return

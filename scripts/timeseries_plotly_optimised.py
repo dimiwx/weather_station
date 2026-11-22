@@ -1,4 +1,5 @@
-import os, glob, gzip, io, math, threading, time, urllib.parse
+import os, glob, gzip, io, math, sqlite3, threading, time, urllib.parse
+from functools import lru_cache
 from dotenv import load_dotenv
 
 # Load environment variables from the .env file
@@ -12,6 +13,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo  # Python 3.9+
 import ephem
@@ -1011,6 +1013,7 @@ TABS = [
     ("Wind Time Series", "Wind Time Series"),
     ("Air Quality Monitoring", "Air Quality Monitoring"),
     ("Rain Accumulation", "Rain Accumulation"),
+    ("History", "History"),
     ("Cloud Camera", "Cloud Camera"),
     ("Satellite Greece", "Satellite Greece"),
     ("Temperature Anomaly", "Temperature Anomaly"),
@@ -1053,6 +1056,223 @@ app.layout = html.Div(
         "fontFamily": "Roboto, sans-serif"
     }
 )
+
+# ----------------------------------------------------------------------------
+# History tab: any parameters from the SQLite DB over any time range
+# ----------------------------------------------------------------------------
+DB_PATH = "/home/dimitris/weather_station.db"
+HISTORY_MAX_POINTS = 1500   # per line: the Pi averages the readings into at most this many bins
+HISTORY_MAX_PARAMS = 8
+HISTORY_BINS = [60, 120, 300, 600, 1800, 3600, 3 * 3600, 6 * 3600, 12 * 3600, 86400, 2 * 86400, 7 * 86400]
+HISTORY_PRESETS = {"1d": timedelta(days=1), "7d": timedelta(days=7), "30d": timedelta(days=30), "365d": timedelta(days=365)}
+# key: (label, SQL aggregate per bin or None when computed specially, unit, colour, how to draw)
+HISTORY_PARAMS = {
+    "t_mcp": ("Temperature (MCP9808)", f'AVG("{COL_T_MCP}")', "°C", "#d62728", "lines"),
+    "t_bme": ("Temperature (BME280)", f'AVG("{COL_T_BME}")', "°C", "#1f77b4", "lines"),
+    "rh": ("Relative humidity (BME280)", f'AVG("{COL_RH}")', "%", "#17a2b8", "lines"),
+    "p": ("Pressure (BME280)", f'AVG("{COL_P}")', "hPa", "#6f42c1", "lines"),
+    "ws": ("Wind speed (mean)", f'AVG("{COL_WS}")', "m/s", "#2ca02c", "lines"),
+    "ws_max": ("Wind speed (highest reading)", f'MAX("{COL_WS}")', "m/s", "#7fbf7b", "lines"),
+    "wd": ("Wind direction (vector mean)", None, "°", "#8c564b", "markers"),
+    "rain": ("Rain", None, "mm", "#1565c0", "rain"),
+    "rain_wet": ("Rain sensor wet (LM393, share of readings)",
+                 f"""100.0 * SUM(CASE WHEN "{COL_RAIN_EVENT}" = 'Rain' THEN 1 ELSE 0 END) / NULLIF(COUNT("{COL_RAIN_EVENT}"), 0)""",
+                 "%", "#4fa3e0", "lines"),
+    "lux": ("Light (VEML7700)", f'AVG("{COL_LUX}")', "lux", "#ff7f0e", "lines"),
+    "uv": ("UV index", f'AVG("{COL_UV}")', "", "#9467bd", "lines"),
+    "pm1": ("PM1.0 (PMSA003I)", f'AVG("{COL_PM1}")', "µg/m³", "#7f7f7f", "lines"),
+    "pm25": ("PM2.5 (PMSA003I)", f'AVG("{COL_PM25}")', "µg/m³", "#bcbd22", "lines"),
+    "pm10": ("PM10 (PMSA003I)", f'AVG("{COL_PM10}")', "µg/m³", "#8c6d31", "lines"),
+    "l_dist": ("Lightning distance (nearest)", f'MIN("{COL_LIGHTNING_DIST}")', "km", "#e377c2", "markers"),
+    "l_count": ("Lightning detections", f'COUNT("{COL_LIGHTNING}")', "", "#c51b7d", "bars"),
+}
+_history_lock = threading.Lock()   # one DB query at a time: the page is public and the Pi is small
+
+
+def history_bin(span_s):
+    return next((b for b in HISTORY_BINS if span_s / b <= HISTORY_MAX_POINTS), HISTORY_BINS[-1])
+
+
+def bin_label(b):
+    if b < 3600: return f"{b // 60}-minute"
+    if b < 86400: return f"{b // 3600}-hour"
+    return "daily" if b == 86400 else (f"{b // 86400}-day" if b < 7 * 86400 else "weekly")
+
+
+@lru_cache(maxsize=1)
+def history_first_day(day):
+    """First date in the DB (cached per day)."""
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=30)
+        first = con.execute("SELECT MIN(timestamp) FROM station_readings").fetchone()[0]
+        con.close()
+        return datetime.fromisoformat(first[:19]).date()
+    except Exception:
+        return date(2025, 3, 3)
+
+
+@lru_cache(maxsize=16)
+def history_query(keys, start, end, b):
+    """{key: Series indexed by bin start (UTC)} for the parameters `keys` between `start` and `end` (UTC strings)."""
+    select, names = [], []
+    for k in keys:
+        agg = HISTORY_PARAMS[k][1]
+        if agg:
+            select.append(agg); names.append(k)
+        elif k == "wd":
+            select += [f'AVG(sin_deg("{COL_WD}"))', f'AVG(cos_deg("{COL_WD}"))']; names += ["wd_sin", "wd_cos"]
+        elif k == "rain" and b < 86400:
+            select.append(f'MAX("{COL_RAIN}")'); names.append("rain")   # the running total since UTC midnight
+    with _history_lock:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=30)
+        con.create_function("sin_deg", 1, lambda d: None if d is None else math.sin(math.radians(d)), deterministic=True)
+        con.create_function("cos_deg", 1, lambda d: None if d is None else math.cos(math.radians(d)), deterministic=True)
+        rows = con.execute(f"SELECT CAST(strftime('%s', timestamp) AS INTEGER) / {b} AS bin, {', '.join(select)} "
+                           f"FROM station_readings WHERE timestamp >= ? AND timestamp < ? GROUP BY bin ORDER BY bin",
+                           (start, end)).fetchall() if select else []
+        daily = []
+        if "rain" in keys and b >= 86400:   # daily totals (the day's highest running total), summed per bin
+            daily = con.execute(f"""SELECT CAST(strftime('%s', timestamp) AS INTEGER) / 86400 AS day, MAX("{COL_RAIN}")
+                                    FROM station_readings WHERE timestamp >= ? AND timestamp < ? AND "{COL_RAIN}" IS NOT NULL
+                                    GROUP BY day""", (start, end)).fetchall()
+        con.close()
+    out = {}
+    if rows:
+        df = pd.DataFrame(rows, columns=["bin"] + names)
+        df.index = pd.to_datetime(df.pop("bin") * b, unit="s", utc=True)
+        for k in keys:
+            if k == "wd":
+                s = (np.degrees(np.arctan2(df["wd_sin"], df["wd_cos"])) % 360).dropna()
+            elif k in df.columns:
+                s = df[k].dropna()
+                if k == "l_count": s = s[s > 0]
+            else:
+                continue
+            out[k] = s
+    if daily:
+        d = pd.Series([v for _, v in daily], index=pd.to_datetime([day * 86400 for day, _ in daily], unit="s", utc=True))
+        out["rain"] = d.resample(f"{b}s", origin="epoch").sum(min_count=1).dropna()
+    return out
+
+
+def history_range(preset, start_date, end_date):
+    """(start, end) as UTC datetimes, or None when custom dates are incomplete."""
+    now = datetime.now(ZoneInfo("UTC")).replace(tzinfo=None)
+    if preset in HISTORY_PRESETS:
+        return now - HISTORY_PRESETS[preset], now
+    if preset == "all":
+        return datetime.combine(history_first_day(date.today()), datetime.min.time()), now
+    if start_date and end_date:
+        start = datetime.fromisoformat(start_date[:10])
+        end = datetime.fromisoformat(end_date[:10]) + timedelta(days=1)
+        return (start, end) if end > start else None
+    return None
+
+
+def history_figure(keys, start, end):
+    b = history_bin((end - start).total_seconds())
+    # Round the ends to the bin, so repeated requests reuse the cached query
+    q_start = (start - datetime(1970, 1, 1)).total_seconds() // b * b
+    q_end = -(-(end - datetime(1970, 1, 1)).total_seconds() // b) * b
+    to_str = lambda s: datetime.utcfromtimestamp(s).strftime("%Y-%m-%d %H:%M:%S")
+    data = history_query(tuple(keys), to_str(q_start), to_str(q_end), b)
+    n = len(keys)
+    fig = make_subplots(rows=n, cols=1, shared_xaxes=True, vertical_spacing=min(0.06, 0.25 / n),
+                        subplot_titles=[HISTORY_PARAMS[k][0] + (f" ({HISTORY_PARAMS[k][2]})" if HISTORY_PARAMS[k][2] else "")
+                                        for k in keys])
+    max_gap = timedelta(seconds=max(3 * b, 1800))
+    for row, k in enumerate(keys, start=1):
+        label, _, unit, color, how = HISTORY_PARAMS[k]
+        s = data.get(k)
+        if s is None or s.empty:
+            fig.add_annotation(text="No data in this period", xref=f"x{row if row > 1 else ''} domain",
+                               yref=f"y{row if row > 1 else ''} domain", x=0.5, y=0.5, showarrow=False,
+                               font=dict(size=13, color="#888"))
+            continue
+        hover = f"%{{y:.2f}} {unit}<extra>{label}</extra>"
+        if how == "bars" or (how == "rain" and b >= 86400):
+            fig.add_trace(go.Bar(x=s.index, y=s.values, marker_color=color, name=label, hovertemplate=hover), row=row, col=1)
+        elif how == "markers":
+            fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="markers", marker=dict(color=color, size=4),
+                                     name=label, hovertemplate=hover), row=row, col=1)
+        else:
+            s = with_gaps(s, max_gap)
+            fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", line=dict(color=color, width=1.6,
+                                     shape="hv" if how == "rain" else "linear"), name=label, hovertemplate=hover),
+                          row=row, col=1)
+        if k == "wd":
+            fig.update_yaxes(range=[0, 360], tickvals=[0, 90, 180, 270, 360], row=row, col=1)
+    fig.update_layout(template="plotly_white", height=140 + 210 * n, showlegend=False, hovermode="x unified",
+                      font=dict(family=FONT_FAMILY, size=12, color="#333"), margin=dict(l=60, r=20, t=40, b=45),
+                      paper_bgcolor="rgba(255,255,255,0.92)", dragmode="zoom")
+    fig.update_xaxes(type="date", range=[start, end], showline=True, linecolor="#999", gridcolor="#eee",
+                     hoverformat="%d %b %Y %H:%M UTC")
+    fig.update_xaxes(title=dict(text="Time (UTC)"), row=n, col=1)
+    fig.update_yaxes(showline=True, linecolor="#999", gridcolor="#eee", zeroline=False)
+    fig.update_annotations(font_size=14)
+    return fig, b
+
+
+def history_tab():
+    first = history_first_day(date.today())
+    label_style = {"fontWeight": "bold", "fontSize": "14px", "marginBottom": "4px", "display": "block"}
+    return html.Div([
+        html.Div([
+            html.Div([html.Label("Parameters (up to 8)", style=label_style),
+                      dcc.Dropdown(id="hist-params", value=["t_mcp"], multi=True, clearable=False,
+                                   options=[{"label": v[0], "value": k} for k, v in HISTORY_PARAMS.items()],
+                                   persistence=True, persistence_type="session")],
+                     style={"flex": "2 1 320px", "minWidth": "260px"}),
+            html.Div([html.Label("Time range", style=label_style),
+                      dcc.RadioItems(id="hist-preset", value="7d", inline=True, persistence=True, persistence_type="session",
+                                     options=[{"label": l, "value": v} for l, v in (("24 h", "1d"), ("7 days", "7d"),
+                                              ("30 days", "30d"), ("1 year", "365d"), ("All", "all"), ("Custom", "custom"))],
+                                     inputStyle={"marginRight": "4px"}, labelStyle={"marginRight": "12px"}),
+                      dcc.DatePickerRange(id="hist-dates", min_date_allowed=first, max_date_allowed=date.today(),
+                                          initial_visible_month=date.today(), display_format="D MMM YYYY",
+                                          start_date_placeholder_text="From", end_date_placeholder_text="To",
+                                          persistence=True, persistence_type="session", style={"marginTop": "6px"})],
+                     style={"flex": "1 1 300px", "minWidth": "260px"}),
+        ], style={"display": "flex", "flexWrap": "wrap", "gap": "16px", "padding": "8px"}),
+        html.Div(id="hist-note", style={"fontSize": "13px", "color": "#555", "padding": "4px 8px"}),
+        dcc.Loading(dcc.Graph(id="hist-graph", config={"displaylogo": False, "responsive": True,
+                                                       "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"]}),
+                    type="circle"),
+    ], style={"backgroundColor": "rgba(255,255,255,0.92)", "padding": "6px"})
+
+
+@app.callback(Output("hist-preset", "value"), Input("hist-dates", "start_date"), Input("hist-dates", "end_date"),
+              prevent_initial_call=True)
+def history_pick_custom(start_date, end_date):
+    """Picking dates switches the range to Custom."""
+    if start_date and end_date:
+        return "custom"
+    raise PreventUpdate
+
+
+@app.callback(Output("hist-graph", "figure"), Output("hist-note", "children"),
+              Input("hist-params", "value"), Input("hist-preset", "value"),
+              Input("hist-dates", "start_date"), Input("hist-dates", "end_date"))
+def update_history(keys, preset, start_date, end_date):
+    keys = [k for k in (keys or []) if k in HISTORY_PARAMS]
+    if not keys:
+        return message_figure("Choose at least one parameter"), ""
+    note = ""
+    if len(keys) > HISTORY_MAX_PARAMS:
+        keys, note = keys[:HISTORY_MAX_PARAMS], f"Showing the first {HISTORY_MAX_PARAMS} parameters. "
+    rng = history_range(preset, start_date, end_date)
+    if rng is None:
+        return message_figure("Pick a start and an end date"), note
+    try:
+        fig, b = history_figure(keys, *rng)
+    except Exception as e:
+        print(f"History tab error: {type(e).__name__}: {e}")
+        return message_figure("The database is busy or unavailable; try again in a minute."), note
+    note += (f"{rng[0]:%d %b %Y %H:%M} to {rng[1]:%d %b %Y %H:%M} UTC. Each point is a {bin_label(b)} average "
+             "(wind direction: vector mean; highest wind reading: maximum; lightning: nearest distance or number "
+             "of detections; rain: running total since UTC midnight, or daily totals for long ranges).")
+    return fig, note
+
 
 # ----------------------------------------------------------------------------
 # Callbacks
@@ -1260,6 +1480,9 @@ def station_tab():
 
 def content_version(tab, df):
     """Changes only when what the tab shows would change, so unchanged tabs aren't re-sent."""
+    if tab == "History":
+        # Its controls drive its own callbacks; the layout only changes with the date picker's last day
+        return f"{tab}|{date.today()}"
     if tab == "The Station":
         return f"{tab}|{os.path.getmtime(STATION_PHOTO) if os.path.exists(STATION_PHOTO) else 0}"
     if tab == "Satellite Greece":
@@ -1337,6 +1560,8 @@ def render_tab(tab, df):
         return graph(create_rain_figure(df))
     if tab == "Upper Air Sounding":
         return sounding_tab()
+    if tab == "History":
+        return history_tab()
     if tab == "The Station":
         return station_tab()
     if tab == "Satellite Greece":
