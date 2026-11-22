@@ -16,6 +16,7 @@ Robustness (2026-11-19):
 """
 import os
 import re
+import subprocess
 import sys
 import time
 import argparse
@@ -86,19 +87,68 @@ _event_lock = threading.Lock()
 EVENT_LOG = Path(DEFAULT_EVENT_LOG)
 
 
+FLOOD_LIMIT = 20          # the same message more often than this per minute is suppressed (and counted)
+_recent = {}              # message -> [window start (monotonic), count in window, suppressed]
+
+
 def log_event(message: str):
-    """Prints a line and appends it, with the local time, to EVENT_LOG."""
+    """Prints a line and appends it, with the local time, to EVENT_LOG. A message repeated more than FLOOD_LIMIT
+    times a minute is suppressed, then summarised once, so a flood can't push the history out of the capped log."""
+    now = time.monotonic()
+    with _event_lock:
+        start, count, suppressed = _recent.get(message, (now, 0, 0))
+        if now - start >= 60:
+            if suppressed:
+                _write_event(f"(the previous message was repeated {suppressed} more times in a minute: {message[:100]})")
+            start, count, suppressed = now, 0, 0
+        count += 1
+        if count > FLOOD_LIMIT:
+            _recent[message] = (start, count, suppressed + 1)
+            return
+        _recent[message] = (start, count, suppressed)
+        if len(_recent) > 500:
+            _recent.clear()
+        _write_event(message)
+
+
+def _write_event(message: str):
+    """Prints and appends one line (the caller holds _event_lock)."""
     line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}"
     print(line, flush=True)
-    with _event_lock:
-        try:
-            with EVENT_LOG.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-            if EVENT_LOG.stat().st_size > EVENT_LOG_MAX:
-                data = EVENT_LOG.read_bytes()[-EVENT_LOG_MAX // 2:]
-                EVENT_LOG.write_bytes(data[data.find(b"\n") + 1:])
-        except OSError as e:
-            print(f"(could not write the event log: {e})", flush=True)
+    try:
+        with EVENT_LOG.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        if EVENT_LOG.stat().st_size > EVENT_LOG_MAX:
+            data = EVENT_LOG.read_bytes()[-EVENT_LOG_MAX // 2:]
+            EVENT_LOG.write_bytes(data[data.find(b"\n") + 1:])
+    except OSError as e:
+        print(f"(could not write the event log: {e})", flush=True)
+
+
+STUCK_REPEATS = 100   # the same line this many times in a row: the USB-serial chip is replaying a buffer
+
+
+class StuckChip(Exception):
+    pass
+
+
+def usb_reset(port):
+    """USB-reset the device behind a serial port (as if replugged, without cutting its power). Needs root, so it
+    runs one ioctl through passwordless sudo. Returns a short description of what happened."""
+    tty = os.path.basename(os.path.realpath(port))
+    d = os.path.realpath(f"/sys/class/tty/{tty}/device")
+    while d != "/" and not os.path.exists(os.path.join(d, "busnum")):
+        d = os.path.dirname(d)
+    if d == "/":
+        return f"no USB device found for {port}"
+    dev = "/dev/bus/usb/{:03d}/{:03d}".format(int(open(os.path.join(d, "busnum")).read()),
+                                               int(open(os.path.join(d, "devnum")).read()))
+    code = f"import fcntl, os; fd = os.open('{dev}', os.O_WRONLY); fcntl.ioctl(fd, {ord('U') << 8 | 20}); os.close(fd)"
+    try:
+        r = subprocess.run(["sudo", "-n", sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"USB reset of {dev} failed: {e}"
+    return f"USB reset of {dev} done" if r.returncode == 0 else f"USB reset of {dev} failed: {r.stderr.strip()[:120]}"
 
 
 def convert_athens_to_utc(ts_str: str, input_tz: ZoneInfo, output_tz: ZoneInfo) -> str:
@@ -202,10 +252,24 @@ class Reader(threading.Thread):
                 self.problem = None
             try:
                 with ser:
+                    last, repeats, since = None, 0, 0.0
                     while not self.busy.is_set():
                         raw = ser.readline()
-                        if raw:
-                            self.handle(raw)
+                        if not raw:
+                            continue
+                        # A board never sends one line 100 times within seconds (a board without a clock repeats
+                        # "Time not set" only every 5 s); the CP2102 did, replaying a buffer at ~360 lines/s
+                        if raw == last:
+                            repeats += 1
+                            if repeats >= STUCK_REPEATS and time.monotonic() - since < 10:
+                                raise StuckChip()
+                        else:
+                            last, repeats, since = raw, 0, time.monotonic()
+                        self.handle(raw)
+            except StuckChip:
+                log_event(f"[{self.label}] the same line arrived {STUCK_REPEATS} times within seconds: the USB-serial "
+                          f"chip is stuck replaying data; {usb_reset(self.port)}")
+                time.sleep(RETRY_S)
             except (serial.SerialException, OSError) as e:
                 self.report(f"read error ({e}); reopening every {RETRY_S} s")
                 time.sleep(RETRY_S)
@@ -234,7 +298,12 @@ class Reader(threading.Thread):
             if not CSV_TS_RE.match(line):
                 self.other_since_row += 1
                 rest = line.lstrip("�")
-                if ROUTINE_LINE_RE.match(line):
+                if line.startswith("Time not set yet"):   # the UV board without a clock, every 5 s
+                    if not self.no_clock:
+                        log_event(f"[{self.label}] the board's clock is not set (it was reset?): no rows until "
+                                  "Thonny sets it")
+                        self.no_clock = True
+                elif ROUTINE_LINE_RE.match(line):
                     pass
                 elif rest != line and ROUTINE_FRAGMENT_RE.search(rest):
                     self.absorbed += 1
