@@ -2,3 +2,4 @@ listen_BLE.py
 .env
 awekas.log
 data_alerts_state.json*
+.archive_months.lock

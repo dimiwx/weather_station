@@ -46,6 +46,22 @@ MIN_VALID_YEAR = 2020
 
 # CSV lines start with: YYYY-MM-DD HH:MM:SS,
 CSV_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},")
+CSV_TS_ANYWHERE_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},")
+# The boards' USB link sometimes delivers a corrupted packet: 64 bytes that aren't valid text (U+FFFD once
+# decoded) at the start of a burst of output (230 times in 45 h on the UV board in November 2026). When it
+# lands in front of a data row, the row behind it is intact, so it's recovered (see strip_garbage).
+
+
+def strip_garbage(line):
+    """(row, number of garbage characters) when `line` is garbage followed by an intact CSV row, else None.
+    Only undecodable bytes, control characters and spaces count as garbage, and the row itself must be clean."""
+    m = CSV_TS_ANYWHERE_RE.search(line)
+    if not m or m.start() == 0:
+        return None
+    prefix, row = line[:m.start()], line[m.start():]
+    if "�" in row or not all(c == "�" or ord(c) < 32 or c.isspace() for c in prefix):
+        return None
+    return row, len(prefix)
 # Routine non-CSV output that isn't worth logging (the UV board's per-cycle debug and file-health lines)
 ROUTINE_LINE_RE = re.compile(r"^(Time: |LOG HEALTH: )")
 
@@ -203,7 +219,12 @@ class Reader(threading.Thread):
                 return
             self.lines_since_row += 1
 
-            # Only CSV lines that start with a timestamp are data rows
+            # Only CSV lines that start with a timestamp are data rows (or that do once garbage is removed)
+            if not CSV_TS_RE.match(line):
+                recovered = strip_garbage(line)
+                if recovered:
+                    line, garbage = recovered
+                    log_event(f"[{self.label}] row recovered from behind {garbage} garbage bytes: {line[:80]!r}")
             if not CSV_TS_RE.match(line):
                 self.other_since_row += 1
                 if not ROUTINE_LINE_RE.match(line):
