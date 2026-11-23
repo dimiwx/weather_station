@@ -1,5 +1,11 @@
 {
- "period": "1991-2020",
+ "periods": {
+  "t": "1991-2020",
+  "rh": "1991-2020",
+  "p": "1991-2020",
+  "ws": "1991-2020",
+  "lux": "1991-2020"
+ },
  "location": {
   "latitude": 40.58,
   "longitude": 22.95
@@ -31,6 +37,7 @@
   "rh": "%",
   "p": "hPa (sea level)",
   "ws": "m/s (10 m)",
-  "lux": "lux (station sensor scale)"
+  "lux": "lux (station sensor scale)",
+  "uv": "UV index"
  }
 }
