@@ -18,9 +18,9 @@ def setup_instrument(port, slave_address=1, baudrate=4800):
     return instrument
 
 def main():
-    # Fixed ports based on your discovery:
-    anemometer_port = '/dev/ttyUSB0'  # Anemometer: wind speed sensor
-    wind_vane_port   = '/dev/ttyUSB3'  # Wind vane: wind direction sensor
+    # Physical USB sockets (by-path), not /dev/ttyUSB* numbers: those swap between boots.
+    anemometer_port = '/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0-port0'  # Anemometer: wind speed sensor
+    wind_vane_port   = '/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0-port0'  # Wind vane: wind direction sensor
 
     # Set up instruments
     anemometer = setup_instrument(anemometer_port)
@@ -50,8 +50,10 @@ def main():
 
             # Read from the wind vane: register 1 holds wind direction in degrees
             raw_degree = wind_vane.read_register(1, 0)
-            # Calibrate wind direction: subtract 45 degrees and apply modulo 360.
-            calibrated_degree = (raw_degree - 90) % 360
+            # Calibrate wind direction: -90° for how the vane is mounted, then +23° from comparing
+            # 79 windy hours (17-31 Oct 2026) with the Open-Meteo model, which showed the station
+            # reading a consistent 23° counter-clockwise. Applied from 2026-10-31; older rows lack it.
+            calibrated_degree = (raw_degree - 90 + 23) % 360
 
             # Get the current timestamp (UTC e.g., "2024-05-20 12:00:00")
             timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")

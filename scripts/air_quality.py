@@ -28,8 +28,10 @@ while True:
 
     try:
         aqdata = pm25.read()
-    except RuntimeError:
-        print("Unable to read from sensor, retrying...")
+    except (RuntimeError, OSError) as e:
+        # RuntimeError: bad frame/checksum. OSError: I2C bus error (e.g. "Remote I/O error"),
+        # which would otherwise end the script, and nothing restarts it.
+        print(f"Unable to read from sensor ({e}), retrying...")
         continue
 
     # Extract values (mapping sensor keys to PM measurements)

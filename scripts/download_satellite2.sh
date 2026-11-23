@@ -1,66 +1,62 @@
 #!/bin/bash
 
-# Base URL parts
-BASE_URL_PREFIX="https://imn-api.meteoplaza.com/v4/nowcast/tiles/satellite-europe/"
-TILE_INFO="/7/47/70/51/75?outputtype=jpeg" # Adjust tile numbers if needed for your specific view
+#==============================================================================
+# VERSION 5: Download the newest image the server already has. Images appear
+#            about 30 minutes after their nominal time, so try the newest
+#            quarter-hour first and step back, instead of always asking for
+#            the one from 45 minutes ago (VERSION 4). The downloaded timestamp
+#            is passed on so the stamp on the image matches it.
+#==============================================================================
 
-# Define the output directory and file name
+# --- Configuration ---
+BASE_URL_PREFIX="https://imn-rust-lb.infoplaza.io/v4/nowcast/tiles/satellite-europe/"
+TILE_INFO="/7/46/69/52/76?outputtype=jpeg"
 OUTPUT_DIR="/home/dimitris/weather_station/satellite_latest"
 OUTPUT_FILE="satellite_greece.jpg"
 OUTPUT_PATH="$OUTPUT_DIR/$OUTPUT_FILE"
+TMP_PATH="$OUTPUT_DIR/.download.jpg"            # partial downloads never replace the current image
+LAST_FILE="$OUTPUT_DIR/.last_timestamp"         # newest image already processed
+MAX_AGE_MIN=90                                  # give up looking further back than this
 
-# Ensure the output directory exists
+# --- End Configuration ---
+
 mkdir -p "$OUTPUT_DIR"
+echo "Starting satellite image download loop..."
 
 while true; do
-    # --- Calculate the timestamp for the latest available image ---
-    # Get current UTC time components
-    CURRENT_YEAR=$(date -u +%Y)
-    CURRENT_MONTH=$(date -u +%m)
-    CURRENT_DAY=$(date -u +%d)
-    CURRENT_HOUR=$(date -u +%H)
-    CURRENT_MINUTE=$(date -u +%M)
+    echo "-----------------------------------------------------"
+    echo "$(date): Looking for the newest satellite image."
 
-    # Calculate the minute of the last 15-minute interval (00, 15, 30, 45)
-    # Integer division gives the number of full 15-min intervals passed in the hour
-    INTERVAL_NUM=$((CURRENT_MINUTE / 65))
-    # Multiply by 15 to get the starting minute of that interval
-    TARGET_MINUTE_NUM=$((INTERVAL_NUM * 65))
-    # Format the minute to have a leading zero if needed (e.g., 00, 05 -> 00, 15)
-    TARGET_MINUTE=$(printf "%02d" $TARGET_MINUTE_NUM)
-
-    # Construct the timestamp string in YYYYMMDDHHMM format
-    LATEST_TIMESTAMP="${CURRENT_YEAR}${CURRENT_MONTH}${CURRENT_DAY}${CURRENT_HOUR}${TARGET_MINUTE}"
-    # --- End Timestamp Calculation ---
-
-    # Construct the full dynamic URL for the latest image
-    CURRENT_IMAGE_URL="${BASE_URL_PREFIX}${LATEST_TIMESTAMP}${TILE_INFO}"
-
-    echo "$(date): Downloading image for timestamp $LATEST_TIMESTAMP..."
-    echo "URL: $CURRENT_IMAGE_URL"
-    echo "Saving to: $OUTPUT_PATH"
-
-    # Download the image using curl
-    # -f makes curl fail silently on server errors (like 404 Not Found)
-    # -L follows redirects if any
-    curl -f -L -s -o "$OUTPUT_PATH" "$CURRENT_IMAGE_URL"
-
-    # Check curl's exit status
-    if [ $? -eq 0 ]; then
-        # Optional: Add a check for file size > 0 to ensure it's not an empty file
-        if [ -s "$OUTPUT_PATH" ]; then
-            echo "$(date): Download successful for $LATEST_TIMESTAMP."
-        else
-            echo "$(date): Download failed for $LATEST_TIMESTAMP (empty file received). Image might not be available yet."
-            # Optional: remove the empty file if created
-            rm -f "$OUTPUT_PATH"
+    # --- Step 1: Find and download the newest available image ---
+    LATEST_TIMESTAMP=""
+    for AGO in $(seq 0 15 $MAX_AGE_MIN); do
+        T=$(date -u -d "$AGO minutes ago" +%Y%m%d%H%M)
+        CANDIDATE="${T:0:10}$(printf "%02d" $(( (10#${T:10:2} / 15) * 15 )))"
+        if curl -f -L -s -o "$TMP_PATH" "${BASE_URL_PREFIX}${CANDIDATE}${TILE_INFO}" && [ -s "$TMP_PATH" ]; then
+            LATEST_TIMESTAMP="$CANDIDATE"
+            break
         fi
+    done
+
+    # --- Step 2: Process it, unless it is the one already on the dashboard ---
+    if [ -z "$LATEST_TIMESTAMP" ]; then
+        echo "$(date): No image found for the last ${MAX_AGE_MIN} minutes. Check URL or network."
+        rm -f "$TMP_PATH"
+    elif [ "$LATEST_TIMESTAMP" = "$(cat "$LAST_FILE" 2>/dev/null)" ]; then
+        echo "$(date): Newest image (${LATEST_TIMESTAMP} UTC) is already processed."
+        rm -f "$TMP_PATH"
     else
-        # Common curl error codes: 22 (HTTP page not retrieved, e.g., 404), 6 (Could not resolve host), 7 (Failed to connect to host)
-        echo "$(date): Download failed for $LATEST_TIMESTAMP (curl error code $?). Check URL or network. Retrying in 15 minutes."
+        mv "$TMP_PATH" "$OUTPUT_PATH"
+        echo "$(date): Downloaded image for ${LATEST_TIMESTAMP} UTC. Processing image..."
+        if python /home/dimitris/weather_station/satellite_latest/pre-process_image.py "$LATEST_TIMESTAMP" \
+            && python /home/dimitris/weather_station/satellite_latest/process_image.py "$LATEST_TIMESTAMP"; then
+            echo "$LATEST_TIMESTAMP" > "$LAST_FILE"
+        else
+            echo "$(date): Processing failed; it will be retried next cycle."
+        fi
     fi
 
-    # Images update every 15 minutes, so wait 15 minutes before the next attempt.
-    echo "$(date): Waiting 15 minutes (900 seconds) before the next download... "
+    # --- Step 3: Wait for the Next Cycle ---
+    echo "$(date): Waiting 15 minutes (900 seconds) before the next download..."
     sleep 900
 done
