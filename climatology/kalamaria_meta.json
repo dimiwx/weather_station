@@ -1,0 +1,36 @@
+{
+ "period": "1991-2020",
+ "location": {
+  "latitude": 40.58,
+  "longitude": 22.95
+ },
+ "window_days": 15,
+ "lux_per_wm2": 60.0,
+ "built": "2026-11-23",
+ "sources": {
+  "t": "era5_land",
+  "rh": "era5_land",
+  "p": "era5",
+  "ws": "era5",
+  "lux": "era5"
+ },
+ "grid_cells": {
+  "era5_land": {
+   "latitude": 40.600006,
+   "longitude": 23.0,
+   "elevation": 46.0
+  },
+  "era5": {
+   "latitude": 40.5,
+   "longitude": 23.0,
+   "elevation": 46.0
+  }
+ },
+ "units": {
+  "t": "°C",
+  "rh": "%",
+  "p": "hPa (sea level)",
+  "ws": "m/s (10 m)",
+  "lux": "lux (station sensor scale)"
+ }
+}

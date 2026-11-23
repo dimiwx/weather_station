@@ -57,6 +57,11 @@ Everything goes through one append-only CSV: `/home/dimitris/weather_station/wea
     - An `after_request` hook gzips text responses.
     - `drop_zero_glitches()` hides MCP9808 and BME280 readings of exactly 0 when the sensor's last non-zero reading is at least 2 °C from zero (`ZERO_GLITCH_JUMP`). That's the same rule the USB logger applies to new rows; here it covers the glitches already in the CSV, which put a 0.0 °C spike on the chart and the thermometer gauge's daily minimum.
     - `SHOW_NOWCAST_TAB` (off) and `SHOW_BME280_TEMPERATURE` (on since 2026-11-09) toggle those views.
+    - **The 1991–2020 normal** (since 2026-11-23, `SHOW_CLIMATOLOGY`) is drawn in grey behind the 24-hour charts of temperature, humidity, pressure, light and wind speed, and in the History tab: a dashed mean and a band of the 10th to 90th percentile, with the source in the hover. It comes from `climatology/` (see Climatology below), which is loaded once and reloaded when the file changes.
+      - On the 24-hour charts it is the hourly normal for each date and UTC hour, interpolated every 10 minutes (`climatology_at`).
+      - `add_climatology` puts the normal behind the station's lines and turns the legend on.
+      - The light, humidity and pressure charts' station trace is now named "Station".
+      - The UV chart passes `clim="uv"` and makes room for the band, but there is no UV normal yet.
     - The **History** tab (since 2026-11-22) plots any of the DB's parameters (`HISTORY_PARAMS`; up to 8 at once, one panel each on a shared time axis) over a preset range (24 h, 7 days, 30 days, 1 year, all) or custom dates.
       - It queries `~/weather_station.db` read-only, averaging in SQL into at most `HISTORY_MAX_POINTS` (1500) bins per line, from 1-minute up to weekly bins.
       - Wind direction is a vector mean (via Python `sin_deg`/`cos_deg` functions registered on the connection, since this SQLite has no math functions).
@@ -65,6 +70,11 @@ Everything goes through one append-only CSV: `/home/dimitris/weather_station/wea
       - Queries run one at a time (`_history_lock`), and results are cached (`lru_cache`, with the range ends rounded to the bin).
       - Timing on the Pi: short ranges take 0.4–2 s, a year ~5 s, and the whole history ~11 s the first time.
       - Its layout is re-sent only when the date changes, so the 30-s refresh doesn't reset the user's choices; the controls keep their values for the browser session.
+      - A "Show the 1991–2020 normal" checkbox (`hist-normal`, on by default) adds the normal to the panels in `HISTORY_CLIMATOLOGY` (both temperatures, humidity, pressure, mean wind speed, light, UV), matched to the bins (`climatology_binned`).
+        - Bins under 3 hours (`CLIM_SMOOTH_FROM`, up to the 30-day view) get the hourly normal averaged over each bin.
+        - Bins of 3 to 12 hours (the 1-year and all views) get one point a day: the normal daily mean, with a band from the day's lowest hourly 10th percentile to its highest hourly 90th percentile. The daily cycle every few pixels made a solid smear.
+        - Daily and longer bins get the normal of daily means and its percentiles.
+        - The note under the chart explains which of the three applies (`climatology_note`).
     - The Satellite and Cloud Camera tabs play loops through a **clientside** callback, so stepping frames costs the Pi nothing. `animation(prefix, ...)` builds a loop and `register_animation(prefix, hold)` registers its callback (`<prefix>-timer` → `<prefix>-frame`); the newest frame stays for 1 + hold ticks. Components inside tabs need `suppress_callback_exceptions=True`, which is set.
       - Satellite (`sat`): the last `SATELLITE_FRAMES` (5) frames, 800 ms each, from `/satellite-frame/<name>`.
       - Cloud Camera (`cam`): the last `CAMERA_FRAMES` (10) regular photos (not `THUNDER*`), 400 ms each, with a 2-s pause on the newest (`CAMERA_PAUSE_MS`). They're picked by file time, because the `DD-MM-YYYY_…` names don't sort by date, and photos younger than 15 s are skipped while they're still being written. They're served from `/camera-frame/<name>`, which only serves the current 10, scaled to 1600 px and cached in memory.
@@ -90,6 +100,25 @@ Everything goes through one append-only CSV: `/home/dimitris/weather_station/wea
   - Restored: 69 rows that only the DB had, lost from the CSVs while they were split by hand (2025-08-30 18:27–18:29 and 2026-04-01 18:13–18:29 UTC), went back into `August_2025.csv` and `April_2026.csv`.
   - Not touched: the PMSA003I data (the sensor read high before 2026-11-01) and the light readings.
   - Backups from before the cleanup, in `~`: `weather_station_db_backup_2026-11-22.db` (compacted DB), `raw_data_months_backup_2026-11-22.tar.gz`, `weather_station_data_backup_2026-11-22.csv` (before the split) and `…_1546.csv` (before the cleanup).
+- **Climatology** (`build_climatology.py`, repo root, run by hand; a few minutes): the 1991–2020 normal for Kalamaria (40.58 N, 22.95 E) from Open-Meteo's archive API (hourly ERA5 data).
+  - Output, in UTC:
+    - `climatology/kalamaria_hourly.csv`: for each calendar day (`doy` 1–366, numbered as in a leap year, so 1 March is always 61) and each hour, `<var>_mean`, `_p10` and `_p90` of the 930 hourly values from the 30 years within 15 days either side.
+    - `climatology/kalamaria_daily.csv`: the same statistics for daily means.
+    - `climatology/kalamaria_meta.json`: the sources and grid cells.
+  - Variables:
+    - `t` and `rh`, 2 m: ERA5-Land (0.1°, cell 40.6 N 23.0 E).
+    - `p`, sea-level: ERA5 (0.25°, cell 40.5 N 23.0 E).
+    - `ws`, 10 m, m/s: ERA5.
+    - `lux`: ERA5 shortwave radiation × `LUX_PER_WM2` = 60. Open-Meteo's radiation is the mean of the preceding hour, so the value at each hour averages the two neighbouring hours.
+  - The downloads are cached in `climatology/raw/` (18 MB, gitignored), so a re-run only recomputes.
+  - Choices, from comparing with the station (2025-03 to 2026-11):
+    - ERA5's cell for temperature is half sea. Its daily range was 4.6 °C against the station's 6.8 °C, and its bias swung from −0.5 °C in winter to +1.3 °C in summer.
+    - ERA5-Land has the right daily cycle (6.2 °C) and a steady offset: the station is ~1.2 °C warmer in every month (town and siting).
+    - The station's pressure is ~0.6 hPa below ERA5's sea-level pressure.
+    - Its sheltered anemometer reads ~0.9 m/s below ERA5's 10 m wind.
+    - The VEML7700 reads ~60 lux per W/m² of ERA5 sunlight (all-sky), about half of real daylight's ~110–120, so the light normal is on the sensor's scale.
+    - The normal is not adjusted for any of these offsets.
+  - **UV is still missing.** The plan is CAMS's reanalysis (EAC4, `uv_biologically_effective_dose` × 40 = UV index, 2003 onwards, 3-hourly) from the Atmosphere Data Store (`https://ads.atmosphere.copernicus.eu/api`, with the same key as `~/.cdsapirc`). On 2026-11-23 it refused the request until the account accepts the ADS terms of use, its data-protection statement and the dataset's CAMS licence. Only the user can accept them, on the website. Open-Meteo has no historical UV.
 - **Memory:** the archives hold ~3 M rows. A script that keeps them all as Python objects exhausts the Pi's 3.6 GB and freezes it; that happened on 2026-11-22 and needed a reboot. Stream the files, work month by month, and cap the script's memory (`resource.setrlimit(resource.RLIMIT_AS, ...)`), so it fails with MemoryError instead.
 
 ## Derived products (each writes into a folder the dashboard reads)
@@ -101,6 +130,7 @@ Everything goes through one append-only CSV: `/home/dimitris/weather_station/wea
 | `7-day_forecast.py` | Open-Meteo API | `7-day_forecast/Kalamaria_forecast.png` |
 | `nowcast.py` | Gemini (`google.generativeai`), given the latest CSV rows, satellite image, sky-camera frames and Skew-T | `nowcasts/nowcast_*.txt` |
 | `download_satellite2.sh` (runs from `~`) | Infoplaza tiles: newest available quarter-hour (~30 min server lag); `satellite_latest/pre-process_image.py` stamps the time, `process_image.py` georeferences it and burns in the coastline (buffered coastline built once) | `satellite_latest/satellite_greece.jpg` → `assets/latest_satellite.png`, plus an animation frame `satellite_latest/history/<YYYYmmddHHMM>.jpg` (1600 px, newest 12 kept; the script passes the image time to `process_image.py`). The dashboard's Satellite tab loops the newest 5 frames |
+| `build_climatology.py` (by hand, see Climatology above) | Open-Meteo archive API: ERA5-Land and ERA5, 1991–2020 | `climatology/kalamaria_{hourly,daily}.csv`, `kalamaria_meta.json` (committed; the dashboard needs them) |
 | `camera_capture.sh` (runs from `~`) | `libcamera-still` every 5 min, 04–18 UTC | `whole_sky_camera/*.jpg` (keeps the 30 newest; files named `THUNDER*` are never pruned) |
 
 ## Secrets

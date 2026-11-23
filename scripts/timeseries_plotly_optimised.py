@@ -437,41 +437,175 @@ def add_line(fig, s, name, color, unit, decimals=1, **kwargs):
     ))
 
 
-def create_line_figure(df, col, title, ytitle, unit, color, decimals=1, max_gap=timedelta(minutes=20), **kwargs):
+# ----------------------------------------------------------------------------
+# Climatology: the 1991-2020 normal for Kalamaria (built by build_climatology.py), drawn behind the charts
+# ----------------------------------------------------------------------------
+SHOW_CLIMATOLOGY = True
+CLIM_DIR = os.path.join(BASE_DIR, "climatology")
+CLIM_PERIOD = "1991–2020"
+CLIM_SOURCES = {"t": "ERA5-Land", "rh": "ERA5-Land", "p": "ERA5, sea level", "ws": "ERA5, 10 m",
+                "lux": "ERA5 sunlight × 60 lux per W/m²", "uv": "CAMS"}
+CLIM_LINE = dict(color="rgba(80, 80, 80, 0.8)", width=1.6, dash="dash")
+CLIM_BAND = "rgba(120, 120, 120, 0.15)"
+
+
+@lru_cache(maxsize=1)
+def _climatology(mtime):
+    """{var: (hourly array (366*24, 3), daily array (366, 3))} of mean, p10, p90; reloaded when the file changes."""
+    hourly = pd.read_csv(os.path.join(CLIM_DIR, "kalamaria_hourly.csv"))
+    daily = pd.read_csv(os.path.join(CLIM_DIR, "kalamaria_daily.csv"))
+    out = {}
+    for c in hourly.columns:
+        if c.endswith("_mean"):
+            v = c[:-len("_mean")]
+            cols = [f"{v}_mean", f"{v}_p10", f"{v}_p90"]
+            out[v] = (hourly[cols].to_numpy(float), daily[cols].to_numpy(float))
+    return out
+
+
+def climatology_tables():
+    if not SHOW_CLIMATOLOGY:
+        return {}
+    try:
+        return _climatology(os.path.getmtime(os.path.join(CLIM_DIR, "kalamaria_hourly.csv")))
+    except Exception as e:
+        print(f"Climatology unavailable: {type(e).__name__}: {e}")
+        return {}
+
+
+def _leap_doy0(idx):
+    """0-365: a date's position in a leap year, as in build_climatology.py (1 March is always 60)."""
+    doy = idx.dayofyear.to_numpy() - 1
+    return np.where(~idx.is_leap_year & (doy >= 59), doy + 1, doy)
+
+
+def _epoch_times(start_s, end_s, step_s):
+    return pd.to_datetime(np.arange(start_s, end_s, step_s), unit="s", utc=True)
+
+
+def climatology_at(var, times):
+    """The hourly normal (columns mean, p10, p90) at the UTC `times`, interpolated between the hours."""
+    table = climatology_tables().get(var)
+    if table is None or len(times) == 0:
+        return None
+    hourly = table[0]
+    pos = _leap_doy0(times) * 24 + times.hour.to_numpy() + (times.minute.to_numpy() + times.second.to_numpy() / 60) / 60
+    i = np.floor(pos).astype(int)
+    f = (pos - i)[:, None]
+    values = hourly[i % len(hourly)] * (1 - f) + hourly[(i + 1) % len(hourly)] * f
+    return pd.DataFrame(values, index=times, columns=["mean", "p10", "p90"])
+
+
+CLIM_SMOOTH_FROM = 3 * 3600   # history bins at least this long get the seasonal (daily) normal, not the daily cycle
+
+
+def climatology_binned(var, start_s, end_s, b):
+    """The normal for a history chart of `b`-second bins (UTC index):
+    - bins under CLIM_SMOOTH_FROM: the hourly normal averaged over each bin (index: bin start, as the data);
+    - longer bins under a day: one point per day at noon, the normal daily mean with the range of the day's
+      hourly values (lowest 10th to highest 90th percentile), since drawing the daily cycle every few pixels
+      over months turns it into a smear;
+    - daily and longer bins: the normal of daily means (and its percentiles), averaged per bin."""
+    table = climatology_tables().get(var)
+    if table is None:
+        return None
+    if b < CLIM_SMOOTH_FROM:
+        step = min(b, 3600)
+        c = climatology_at(var, _epoch_times(start_s + step / 2, end_s, step))   # the middle of each step
+        return c.resample(f"{b}s", origin="epoch").mean().dropna()
+    days = _epoch_times(start_s // 86400 * 86400, end_s, 86400)
+    d = _leap_doy0(days)
+    if b < 86400:
+        hourly = table[0].reshape(366, 24, 3)
+        values = np.column_stack([table[1][d, 0], hourly[d, :, 1].min(axis=1), hourly[d, :, 2].max(axis=1)])
+        return pd.DataFrame(values, index=days + pd.Timedelta(hours=12), columns=["mean", "p10", "p90"])
+    c = pd.DataFrame(table[1][d], index=days, columns=["mean", "p10", "p90"])
+    return c.resample(f"{b}s", origin="epoch").mean().dropna()
+
+
+def climatology_note(b):
+    """How the History tab's normal is drawn at bin size `b`."""
+    how = ("averaged the same way, with the range of 80 % of the hourly values (10th to 90th percentile)"
+           if b < CLIM_SMOOTH_FROM else
+           "as its daily mean, with the range of 80 % of the hourly values through the day (from the lowest 10th "
+           "to the highest 90th percentile)" if b < 86400 else
+           "as daily means, with the range of 80 % of the daily means (10th to 90th percentile)")
+    return (f" Grey: the {CLIM_PERIOD} normal for Kalamaria (dashed), {how}. Temperature and humidity from "
+            "ERA5-Land; sea-level pressure, 10 m wind and light from ERA5 (light: sunlight × 60 lux per W/m², "
+            "this sensor's ratio).")
+
+
+def add_climatology(fig, var, unit, decimals=1, c=None, row=None, col=None, showlegend=True):
+    """Grey 10-90 % band and dashed mean of the normal. Without `c`, over the 24-hour axis of base_figure, moved
+    under the station's lines. Returns the normal drawn (or None)."""
+    on_24h_axis = c is None
+    if on_24h_axis:
+        end = time.time()
+        c = climatology_at(var, _epoch_times((end - DATA_WINDOW.total_seconds()) // 600 * 600, end + 600, 600))
+    if c is None or c.empty:
+        return None
+    n = len(fig.data)
+    where = dict(row=row, col=col) if row else {}
+    name = f"Normal {CLIM_PERIOD}"
+    rng = c[["p10", "p90"]].round(decimals).values
+    fig.add_trace(go.Scatter(x=c.index, y=c["p90"].round(decimals).values, mode="lines", line=dict(width=0),
+                             hoverinfo="skip", showlegend=False, legendgroup="clim"), **where)
+    fig.add_trace(go.Scatter(x=c.index, y=c["p10"].round(decimals).values, mode="lines", line=dict(width=0),
+                             fill="tonexty", fillcolor=CLIM_BAND, name="Normal range (10–90 %)", hoverinfo="skip",
+                             legendgroup="clim", showlegend=showlegend), **where)
+    fig.add_trace(go.Scatter(
+        x=c.index, y=c["mean"].round(decimals).values, mode="lines", line=CLIM_LINE, name=name, customdata=rng,
+        legendgroup="clim", showlegend=showlegend,
+        hovertemplate=(f"%{{y:.{decimals}f}} {unit} (10–90 %: %{{customdata[0]:.{decimals}f}} to "
+                       f"%{{customdata[1]:.{decimals}f}})<extra>{name} ({CLIM_SOURCES.get(var, '')})</extra>")), **where)
+    if on_24h_axis:
+        fig.data = fig.data[n:] + fig.data[:n]   # behind the station's lines
+        fig.update_layout(showlegend=True)
+    return c
+
+
+def create_line_figure(df, col, title, ytitle, unit, color, decimals=1, max_gap=timedelta(minutes=20), clim=None,
+                       **kwargs):
     fig = base_figure(title, ytitle)
     s = series(df, col)
+    if not s.empty:
+        add_line(fig, with_gaps(s, max_gap), "Station", color, unit, decimals, **kwargs)
+    if clim:
+        add_climatology(fig, clim, unit, decimals)
     if s.empty:
         return no_data(fig)
-    add_line(fig, with_gaps(s, max_gap), title, color, unit, decimals, **kwargs)
     return fig
 
 
 def create_temperature_figure(df):
     fig = base_figure("Temperature", "Temperature (°C)", show_legend=SHOW_BME280_TEMPERATURE)
     s = series(df, COL_T_MCP)
-    if s.empty and not SHOW_BME280_TEMPERATURE:
-        return no_data(fig)
     add_line(fig, with_gaps(s, timedelta(minutes=20)), "MCP9808", "#d62728", "°C")
+    bme = series(df, COL_T_BME) if SHOW_BME280_TEMPERATURE else s.iloc[:0]
     if SHOW_BME280_TEMPERATURE:
-        add_line(fig, with_gaps(series(df, COL_T_BME), timedelta(minutes=20)), "BME280", "#1f77b4", "°C")
+        add_line(fig, with_gaps(bme, timedelta(minutes=20)), "BME280", "#1f77b4", "°C")
+    add_climatology(fig, "t", "°C")
+    if s.empty and bme.empty:
+        return no_data(fig)
     return fig
 
 
 def create_humidity_figure(df):
-    fig = create_line_figure(df, COL_RH, "Relative Humidity", "Relative humidity (%)", "%", "#17a2b8", decimals=0)
+    fig = create_line_figure(df, COL_RH, "Relative Humidity", "Relative humidity (%)", "%", "#17a2b8", decimals=0,
+                             clim="rh")
     fig.update_yaxes(range=[0, 100])
     return fig
 
 
 def create_pressure_figure(df):
-    fig = create_line_figure(df, COL_P, "Atmospheric Pressure", "Pressure (hPa)", "hPa", "#6f42c1")
+    fig = create_line_figure(df, COL_P, "Atmospheric Pressure", "Pressure (hPa)", "hPa", "#6f42c1", clim="p")
     fig.update_yaxes(tickformat=".1f")  # "1023.2", not "1,023.2"
     return fig
 
 
 def create_light_figure(df):
     return create_line_figure(df, COL_LUX, "Ambient Visible Light", "Illuminance (lux)", "lux", "#e0a100",
-                              decimals=0, fill="tozeroy", fillcolor="rgba(255, 193, 7, 0.25)")
+                              decimals=0, clim="lux", fill="tozeroy", fillcolor="rgba(255, 193, 7, 0.25)")
 
 
 # WHO UV index categories
@@ -483,9 +617,10 @@ UV_BANDS = [(0, 3, "Low", "rgba(76, 175, 80, 0.14)"),
 
 
 def create_uv_figure(df):
-    fig = create_line_figure(df, COL_UV, "UV Index", "UV index", "", "#6a1b9a")
-    s = series(df, COL_UV)
-    ymax = max(6.0, math.ceil((s.max() if not s.empty else 0) + 1))
+    fig = create_line_figure(df, COL_UV, "UV Index", "UV index", "", "#6a1b9a", clim="uv")
+    ys = [np.asarray(t.y, dtype=float) for t in fig.data if t.y is not None and len(t.y)]
+    top = max([0.0] + [float(y[np.isfinite(y)].max()) for y in ys if np.isfinite(y).any()])   # incl. the normal
+    ymax = max(6.0, math.ceil(top + 1))
     for lo, hi, label, color in UV_BANDS:
         if lo < ymax:
             fig.add_hrect(y0=lo, y1=min(hi, ymax), fillcolor=color, line_width=0, layer="below",
@@ -526,6 +661,7 @@ def create_wind_timeseries_figure(df):
                         color="rgba(200, 30, 30, 0.85)", line=dict(width=1, color="DarkSlateGrey")),
         ))
         fig.update_layout(yaxis2=dict(visible=False, range=[0, 1.12], overlaying="y", fixedrange=True))
+    add_climatology(fig, "ws", "m/s")
     fig.update_layout(yaxis=dict(rangemode="tozero"))
     return fig
 
@@ -1086,6 +1222,8 @@ HISTORY_PARAMS = {
     "l_dist": ("Lightning distance (nearest)", f'MIN("{COL_LIGHTNING_DIST}")', "km", "#e377c2", "markers"),
     "l_count": ("Lightning detections", f'COUNT("{COL_LIGHTNING}")', "", "#c51b7d", "bars"),
 }
+# The normal drawn in a parameter's panel (build_climatology.py's variables)
+HISTORY_CLIMATOLOGY = {"t_mcp": "t", "t_bme": "t", "rh": "rh", "p": "p", "ws": "ws", "lux": "lux", "uv": "uv"}
 _history_lock = threading.Lock()   # one DB query at a time: the page is public and the Pi is small
 
 
@@ -1169,7 +1307,7 @@ def history_range(preset, start_date, end_date):
     return None
 
 
-def history_figure(keys, start, end):
+def history_figure(keys, start, end, show_normal=True):
     b = history_bin((end - start).total_seconds())
     # Round the ends to the bin, so repeated requests reuse the cached query
     q_start = (start - datetime(1970, 1, 1)).total_seconds() // b * b
@@ -1181,8 +1319,14 @@ def history_figure(keys, start, end):
                         subplot_titles=[HISTORY_PARAMS[k][0] + (f" ({HISTORY_PARAMS[k][2]})" if HISTORY_PARAMS[k][2] else "")
                                         for k in keys])
     max_gap = timedelta(seconds=max(3 * b, 1800))
+    normal_shown = False
     for row, k in enumerate(keys, start=1):
         label, _, unit, color, how = HISTORY_PARAMS[k]
+        if show_normal and k in HISTORY_CLIMATOLOGY:
+            c = climatology_binned(HISTORY_CLIMATOLOGY[k], q_start, q_end, b)
+            if c is not None and not c.empty:
+                add_climatology(fig, HISTORY_CLIMATOLOGY[k], unit, 0 if k == "lux" else 1, c=c, row=row, col=1)
+                normal_shown = True
         s = data.get(k)
         if s is None or s.empty:
             fig.add_annotation(text="No data in this period", xref=f"x{row if row > 1 else ''} domain",
@@ -1210,7 +1354,7 @@ def history_figure(keys, start, end):
     fig.update_xaxes(title=dict(text="Time (UTC)"), row=n, col=1)
     fig.update_yaxes(showline=True, linecolor="#999", gridcolor="#eee", zeroline=False)
     fig.update_annotations(font_size=14)
-    return fig, b
+    return fig, b, normal_shown
 
 
 def history_tab():
@@ -1231,7 +1375,10 @@ def history_tab():
                       dcc.DatePickerRange(id="hist-dates", min_date_allowed=first, max_date_allowed=date.today(),
                                           initial_visible_month=date.today(), display_format="D MMM YYYY",
                                           start_date_placeholder_text="From", end_date_placeholder_text="To",
-                                          persistence=True, persistence_type="session", style={"marginTop": "6px"})],
+                                          persistence=True, persistence_type="session", style={"marginTop": "6px"}),
+                      dcc.Checklist(id="hist-normal", value=["on"], persistence=True, persistence_type="session",
+                                    options=[{"label": f"Show the {CLIM_PERIOD} normal (grey)", "value": "on"}],
+                                    inputStyle={"marginRight": "4px"}, style={"marginTop": "8px"})],
                      style={"flex": "1 1 300px", "minWidth": "260px"}),
         ], style={"display": "flex", "flexWrap": "wrap", "gap": "16px", "padding": "8px"}),
         html.Div(id="hist-note", style={"fontSize": "13px", "color": "#555", "padding": "4px 8px"}),
@@ -1252,8 +1399,8 @@ def history_pick_custom(start_date, end_date):
 
 @app.callback(Output("hist-graph", "figure"), Output("hist-note", "children"),
               Input("hist-params", "value"), Input("hist-preset", "value"),
-              Input("hist-dates", "start_date"), Input("hist-dates", "end_date"))
-def update_history(keys, preset, start_date, end_date):
+              Input("hist-dates", "start_date"), Input("hist-dates", "end_date"), Input("hist-normal", "value"))
+def update_history(keys, preset, start_date, end_date, normal):
     keys = [k for k in (keys or []) if k in HISTORY_PARAMS]
     if not keys:
         return message_figure("Choose at least one parameter"), ""
@@ -1264,13 +1411,15 @@ def update_history(keys, preset, start_date, end_date):
     if rng is None:
         return message_figure("Pick a start and an end date"), note
     try:
-        fig, b = history_figure(keys, *rng)
+        fig, b, normal_shown = history_figure(keys, *rng, show_normal=bool(normal))
     except Exception as e:
         print(f"History tab error: {type(e).__name__}: {e}")
         return message_figure("The database is busy or unavailable; try again in a minute."), note
     note += (f"{rng[0]:%d %b %Y %H:%M} to {rng[1]:%d %b %Y %H:%M} UTC. Each point is a {bin_label(b)} average "
              "(wind direction: vector mean; highest wind reading: maximum; lightning: nearest distance or number "
              "of detections; rain: running total since UTC midnight, or daily totals for long ranges).")
+    if normal_shown:
+        note += climatology_note(b)
     return fig, note
 
 

@@ -3,3 +3,4 @@ listen_BLE.py
 awekas.log
 data_alerts_state.json*
 .archive_months.lock
+climatology/raw/
