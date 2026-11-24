@@ -62,7 +62,7 @@ Everything goes through one append-only CSV: `/home/dimitris/weather_station/wea
       - On the 24-hour charts it is the hourly normal for each date and UTC hour, interpolated every 10 minutes (`climatology_at`).
       - `add_climatology` puts the normal behind the station's lines and turns the legend on.
       - The light, humidity and pressure charts' station trace is now named "Station".
-      - The UV chart passes `clim="uv"` and makes room for the band. The UV normal covers 2016–2025 instead (`CLIM_PERIODS`), which its legend entry and the History note say. Until the tables have `uv` columns (see Climatology below), the UV chart and panel simply show no normal.
+      - The UV chart passes `clim="uv"` and makes room for the band. The UV normal covers other years, read from `kalamaria_meta.json`'s `periods` (`climatology_period`, reloaded when the file changes) for its legend entry and the History note. Until the tables have `uv` columns (see Climatology below), the UV chart and panel simply show no normal and the note leaves UV out.
     - The **History** tab (since 2026-11-22) plots any of the DB's parameters (`HISTORY_PARAMS`; up to 8 at once, one panel each on a shared time axis) over a preset range (24 h, 7 days, 30 days, 1 year, all) or custom dates.
       - It queries `~/weather_station.db` read-only, averaging in SQL into at most `HISTORY_MAX_POINTS` (1500) bins per line, from 1-minute up to weekly bins.
       - Wind direction is a vector mean (via Python `sin_deg`/`cos_deg` functions registered on the connection, since this SQLite has no math functions).
@@ -126,18 +126,18 @@ Everything goes through one append-only CSV: `/home/dimitris/weather_station/wea
     - Its sheltered anemometer reads ~0.9 m/s below ERA5's 10 m wind.
     - The VEML7700 reads ~60 lux per W/m² of ERA5 sunlight (all-sky), about half of real daylight's ~110–120, so the light normal is on the sensor's scale.
     - The normal is not adjusted for any of these offsets.
-  - **UV** (`uv`, 2016–2025, a shorter period): Open-Meteo has no historical UV, and neither has CAMS's reanalysis (EAC4).
+  - **UV** (`uv`, up to 2016–2025, a shorter period): Open-Meteo has no historical UV, and neither has CAMS's reanalysis (EAC4). Open-Meteo's historical-forecast API has hourly `uv_index` from 2021-03-23, but only from GFS, which reads 1.4–1.8× CAMS at winter middays (above even the clear-sky value), so it isn't used.
     - Source: CAMS global atmospheric composition forecasts (`cams-global-atmospheric-composition-forecasts`), from the Atmosphere Data Store (`https://ads.atmosphere.copernicus.eu/api`, same key as `~/.cdsapirc`; the account has accepted the ADS terms and the CAMS licence).
     - What it uses: lead hours 1–24 of each day's 00 UTC run. `uvbed` (UV biologically effective dose, an instantaneous W/m²) × 40 = UV index, interpolated to the station from the 4 points of the 0.4° grid around it.
     - 2025 checks out: about 8 at midday in mid-July, peaking at solar noon (~10:30 UTC), with monthly midday means from ~1.1 (December) to 8.4 (July).
     - The data store's limits:
       - at most 10,000 fields per request (a year is 9,125), so one request per year;
-      - at most 2 requests queued per dataset and user (`UV_QUEUE`); more are rejected.
-    - Each request waits hours: on 2026-11-23, 2025 queued for 5.4 h and ran for 8 min, while 2016 was still running after 6 h (tape).
-    - Resuming: request ids are kept in `climatology/raw/cams_uv_jobs.json` and the years in `cams_uv_<year>.nc`, so a re-run picks up where it stopped. `--skip-uv` builds the rest without UV.
-    - The UV columns are only written once all 10 years are in, and only if the highest value is plausible (5–16). The dashboard reads the new tables without a restart.
-    - Status: on 2026-11-23 a build (`python3 -u build_climatology.py`, log in `climatology/raw/build.log`) was left running to fetch the remaining years.
-    - `kalamaria_meta.json` gives each variable's period (`periods`).
+      - at most 2 requests waiting in the queue per dataset and user (`UV_QUEUE`); more are rejected. Running requests don't count (2018 was accepted on 2026-11-24 while 2016 was queued and 2017 running), so the build sends the next year as soon as one starts running, up to `UV_MAX_OPEN` (5) open at once.
+    - Requests are slow and old years slower: 2025 queued for 5.4 h and ran for 8 min; 2017 queued ~19 h and was still running 8.5 h later. 2016 ran ~21 h, was restarted by the data store, and failed with no reason given. So the build asks for the newest years first.
+    - Resuming: request ids are kept in `climatology/raw/cams_uv_jobs.json`, failures per year in `cams_uv_failures.json`, and the years in `cams_uv_<year>.nc`, so a re-run picks up where it stopped. A year that fails 3 times (`UV_MAX_FAILURES`) is left out. `--skip-uv` builds the rest without UV.
+    - The normal grows backwards from 2025 (`uv_block`). The UV columns are written once the 5 newest years are in (`UV_MIN_YEARS`), and rewritten as each older year arrives. An older year that arrives early waits until the years between are in, so there's never a gap a later download would fill. Values must be plausible (highest 5–16). Every write replaces the files in one step, and the dashboard reads the new tables without a restart.
+    - `kalamaria_meta.json` gives each variable's period (`periods`), e.g. `"uv": "2021-2025"`, or `"2016-2025 without 2019"` if a year was left out.
+    - Status: since 2026-11-25 00:11 a build (`python3 -u build_climatology.py`, detached, log in `climatology/raw/build.log`) is fetching the remaining years, 2024 and 2023 first.
 - **Memory:** the archives hold ~3 M rows. A script that keeps them all as Python objects exhausts the Pi's 3.6 GB and freezes it; that happened on 2026-11-22 and needed a reboot. Stream the files, work month by month, and cap the script's memory (`resource.setrlimit(resource.RLIMIT_AS, ...)`), so it fails with MemoryError instead.
 
 ## Derived products (each writes into a folder the dashboard reads)
@@ -149,7 +149,7 @@ Everything goes through one append-only CSV: `/home/dimitris/weather_station/wea
 | `7-day_forecast.py` | Open-Meteo API | `7-day_forecast/Kalamaria_forecast.png` |
 | `nowcast.py` | Gemini (`google.generativeai`), given the latest CSV rows, satellite image, sky-camera frames and Skew-T | `nowcasts/nowcast_*.txt` |
 | `download_satellite2.sh` (runs from `~`) | Infoplaza tiles: newest available quarter-hour (~30 min server lag); `satellite_latest/pre-process_image.py` stamps the time, `process_image.py` georeferences it and burns in the coastline (buffered coastline built once) | `satellite_latest/satellite_greece.jpg` → `assets/latest_satellite.png`, plus an animation frame `satellite_latest/history/<YYYYmmddHHMM>.jpg` (1600 px, newest 12 kept; the script passes the image time to `process_image.py`). The dashboard's Satellite tab loops the newest 5 frames |
-| `build_climatology.py` (by hand, see Climatology above) | Open-Meteo archive API: ERA5-Land and ERA5, 1991–2020; UV from CAMS forecasts (Atmosphere Data Store), 2016–2025 | `climatology/kalamaria_{hourly,daily}.csv`, `kalamaria_meta.json` (committed; the dashboard needs them) |
+| `build_climatology.py` (by hand, see Climatology above) | Open-Meteo archive API: ERA5-Land and ERA5, 1991–2020; UV from CAMS forecasts (Atmosphere Data Store), up to 2016–2025, newest years first | `climatology/kalamaria_{hourly,daily}.csv`, `kalamaria_meta.json` (committed; the dashboard needs them) |
 | `camera_capture.sh` (runs from `~`) | `libcamera-still` every 5 min, 04–18 UTC | `whole_sky_camera/*.jpg` (keeps the 30 newest; files named `THUNDER*` are never pruned) |
 
 ## Secrets

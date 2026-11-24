@@ -21,8 +21,11 @@ Sources (Open-Meteo's archive API, hourly, the grid cell nearest 40.58 N, 22.95 
     of each day's 00 UTC run, UV biologically effective dose x 40 = UV index, interpolated to the station from
     the ~0.4° grid. It needs the ADS key (the same as ~/.cdsapirc's) and the ADS terms and the CAMS licence
     accepted on the website. The data store fetches these forecasts from tape: one request per year (its limit
-    is 10,000 fields a request; a year of 25 lead hours is 9,125), which can wait hours in its queue (the files are cached in climatology/raw/ and the request ids in
-    cams_uv_jobs.json, so an interrupted run resumes; --skip-uv builds the rest without UV).
+    is 10,000 fields a request; a year of 25 lead hours is 9,125). In November 2026 a request waited up to a day
+    in its queue, which holds 2 requests per user and dataset (running ones don't count), and some failed
+    without a reason. The files are cached in climatology/raw/, and the request ids and failures in
+    cams_uv_jobs.json and cams_uv_failures.json, so an interrupted run resumes. A year that fails 3 times is left
+    out (the period in kalamaria_meta.json says so); --skip-uv builds the rest without UV.
 
 Output (UTC):
   climatology/kalamaria_hourly.csv  one row per calendar day and hour: doy (1-366, numbered as in a leap year,
@@ -65,8 +68,13 @@ ADS_URL = "https://ads.atmosphere.copernicus.eu/api"
 ADS_DATASET = "cams-global-atmospheric-composition-forecasts"
 UV_AREA = [41.0, 22.6, 40.2, 23.4]   # north, west, south, east: the grid points around the station
 UV_JOBS = os.path.join(RAW_DIR, "cams_uv_jobs.json")   # request ids, so an interrupted run resumes
-UV_QUEUE = 2                         # requests queued at the data store at once (its limit per dataset and user)
-UV_PER_WM2 = 40.0                    # UV index per W/m² of erythemally weighted irradiance
+UV_FAILURES = os.path.join(RAW_DIR, "cams_uv_failures.json")   # failed requests per year, kept across runs
+UV_QUEUE = 2          # requests waiting in the data store's queue at once (its limit per dataset and user;
+                      # running requests don't count)
+UV_MAX_OPEN = 5       # requests at the data store at once, waiting or running
+UV_MAX_FAILURES = 3   # a year whose request fails this often is left out
+UV_MIN_YEARS = 5      # the UV normal is written once this many of the newest years are in
+UV_PER_WM2 = 40.0     # UV index per W/m² of erythemally weighted irradiance
 
 
 def download(model, year):
@@ -139,26 +147,40 @@ def uv_request(year):
             "area": UV_AREA, "data_format": "netcdf_zip"}
 
 
-def download_uv():
-    """Downloads the missing years, keeping UV_QUEUE requests at the data store at a time (it rejects more:
-    "Maximum number queued requests for this dataset has been reached"). Request ids are kept in UV_JOBS, so an
-    interrupted run picks the same requests up again."""
-    missing = [y for y in range(UV_FIRST_YEAR, UV_LAST_YEAR + 1) if not os.path.exists(uv_year_path(y))]
-    if not missing:
-        return
+def _load_json(path):
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_json(path, data):
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def download_uv(on_change=None):
+    """Downloads the missing years and returns the years left out. Calls on_change(left_out) at the start and
+    whenever a year is downloaded or left out. The data store keeps at most UV_QUEUE requests
+    per dataset and user waiting in its queue (it rejects more: "Maximum number queued requests for this dataset
+    has been reached"); running requests don't count, so the next year goes in as soon as one starts running, up
+    to UV_MAX_OPEN at once. Request ids are kept in UV_JOBS and failures in UV_FAILURES, so an interrupted run
+    picks up where it was. A year whose request fails UV_MAX_FAILURES times is left out."""
+    years = range(UV_FIRST_YEAR, UV_LAST_YEAR + 1)
+    jobs, failures = _load_json(UV_JOBS), _load_json(UV_FAILURES)
+    left_out = [y for y in years if failures.get(str(y), 0) >= UV_MAX_FAILURES and not os.path.exists(uv_year_path(y))]
+    # newest first: in November 2026 the 2025 request ran in 8 minutes, the 2016 one for a day
+    pending = [y for y in reversed(years) if not os.path.exists(uv_year_path(y)) and y not in left_out]
+    if on_change:
+        on_change(left_out)
+    if not pending:
+        return left_out
     os.makedirs(RAW_DIR, exist_ok=True)
     client = ads_client()
-    jobs = {}
-    if os.path.exists(UV_JOBS):
-        with open(UV_JOBS) as f:
-            jobs = json.load(f)
-
-    def save():
-        with open(UV_JOBS, "w") as f:
-            json.dump(jobs, f, indent=1)
-
-    print(f"CAMS UV: {len(missing)} years to download, {UV_QUEUE} at a time (each can wait hours)", flush=True)
-    pending, failures, last_report, t0 = list(missing), {}, "", time.time()
+    print(f"CAMS UV: {len(pending)} years to download, {UV_QUEUE} waiting in the queue at a time "
+          f"(each can wait a day)", flush=True)
+    last_report, t0, hold_until = "", time.time(), 0
     while pending:
         states = {}
         for y in [y for y in pending if str(y) in jobs]:
@@ -175,27 +197,39 @@ def download_uv():
                 os.remove(path + ".zip")
                 pending.remove(y)
                 jobs.pop(str(y))
-                save()
+                _save_json(UV_JOBS, jobs)
                 print(f"  {datetime.now():%H:%M} {y}: downloaded ({(time.time() - t0) / 3600:.1f} h so far)", flush=True)
+                if on_change:
+                    on_change(left_out)
             elif states[y] in ("failed", "rejected", "dismissed", "deleted"):
                 jobs.pop(str(y))
-                save()
+                _save_json(UV_JOBS, jobs)
                 try:
                     remote.get_results()   # raises with the data store's reason
                     reason = ""
                 except Exception as e:
                     reason = " ".join(str(e).split())[:300]
-                if "queued requests" not in reason:   # the queue limit only means "try again later"
-                    failures[y] = failures.get(y, 0) + 1
-                    print(f"  {y}: {states[y]} {reason}", flush=True)
-                    if failures[y] >= 3:
-                        print(f"  {y}: giving up after 3 failures", flush=True)
-                        pending.remove(y)
+                if "queued requests" in reason:   # the queue limit only means "try again later"
+                    hold_until = time.time() + 1800
+                    states[y] = "waiting for a place in the queue"
+                    continue
+                failures[str(y)] = failures.get(str(y), 0) + 1
+                _save_json(UV_FAILURES, failures)
+                print(f"  {datetime.now():%H:%M} {y}: {states[y]} ({failures[str(y)]} of {UV_MAX_FAILURES}) {reason}",
+                      flush=True)
+                if failures[str(y)] >= UV_MAX_FAILURES:
+                    print(f"  {y}: left out after {UV_MAX_FAILURES} failures", flush=True)
+                    pending.remove(y)
+                    left_out.append(y)
+                    if on_change:
+                        on_change(left_out)
+        waiting = sum(1 for st in states.values() if st == "accepted")
         open_jobs = sum(1 for y in pending if str(y) in jobs)
-        for y in [y for y in pending if str(y) not in jobs][:max(0, UV_QUEUE - open_jobs)]:
+        free = min(UV_QUEUE - waiting, UV_MAX_OPEN - open_jobs) if time.time() >= hold_until else 0
+        for y in [y for y in pending if str(y) not in jobs][:max(0, free)]:
             try:
                 jobs[str(y)] = client.submit(ADS_DATASET, uv_request(y)).request_id
-                save()
+                _save_json(UV_JOBS, jobs)
                 states[y] = "submitted"
             except Exception as e:
                 print(f"  {y}: not submitted ({type(e).__name__}: {str(e)[:200]})", flush=True)
@@ -206,6 +240,7 @@ def download_uv():
             last_report = report
         if pending:
             time.sleep(120)
+    return sorted(left_out)
 
 
 def uv_file_series(path):
@@ -232,14 +267,21 @@ def uv_file_series(path):
     return s, accumulated
 
 
-def uv_series():
-    """Hourly UV index at the station (UTC), or None while years are missing."""
-    download_uv()
-    years = range(UV_FIRST_YEAR, UV_LAST_YEAR + 1)
-    missing = [y for y in years if not os.path.exists(uv_year_path(y))]
-    if missing:
-        print(f"CAMS UV: {missing} still missing; run again to retry")
-        return None
+def uv_block(left_out):
+    """The years the UV normal uses: back from UV_LAST_YEAR while each year is downloaded (or left out after
+    failing), stopping at the first year still to come. So the normal grows from the newest years backwards
+    and never has a gap a later download would fill."""
+    used = []
+    for y in range(UV_LAST_YEAR, UV_FIRST_YEAR - 1, -1):
+        if os.path.exists(uv_year_path(y)):
+            used.append(y)
+        elif y not in left_out:
+            break
+    return sorted(used)
+
+
+def uv_series(years):
+    """Hourly UV index at the station (UTC) over `years`, or None if the values are implausible."""
     parts = [uv_file_series(uv_year_path(y)) for y in years]
     s = pd.concat(p[0] for p in parts).sort_index()
     s = s[~s.index.duplicated()]
@@ -247,12 +289,40 @@ def uv_series():
     if parts[0][1]:
         # Hourly means of the preceding hour: average neighbours for the value at the hour (as for sunlight)
         s = (s + s.shift(-1)) / 2
-    print(f"CAMS UV: {s.notna().sum()} hours, highest {s.max():.1f}, "
-          f"{'accumulated' if parts[0][1] else 'instantaneous'} field")
+    print(f"CAMS UV {years[0]}-{years[-1]}: {s.notna().sum()} hours, highest {s.max():.1f}, "
+          f"{'accumulated' if parts[0][1] else 'instantaneous'} field", flush=True)
     if not 5 <= s.max() <= 16:   # Thessaloniki's summer UV index peaks around 9-10
-        print("CAMS UV: implausible values, so UV is left out; check the units in uv_file_series")
+        print("CAMS UV: implausible values, so UV is left out; check the units in uv_file_series", flush=True)
         return None
     return s.dropna()
+
+
+def write_tables(stats, periods, cells):
+    """Writes the hourly and daily CSVs and the meta file. stats: {var: (hourly_stats, daily_stats)}. Each file
+    is replaced in one step, so the dashboard never reads half of one."""
+    hourly = {"doy": np.repeat(np.arange(1, 367), 24), "hour": np.tile(np.arange(24), 366)}
+    daily = {"doy": np.arange(1, 367)}
+    for v, (hourly_stats, daily_stats) in stats.items():
+        for name, h, d in zip(("mean", "p10", "p90"), hourly_stats, daily_stats):
+            hourly[f"{v}_{name}"] = h.reshape(-1).round(DECIMALS[v])
+            daily[f"{v}_{name}"] = d.round(DECIMALS[v])
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for name, table in (("kalamaria_hourly.csv", hourly), ("kalamaria_daily.csv", daily)):
+        path = os.path.join(OUT_DIR, name)
+        pd.DataFrame(table).to_csv(path + ".tmp", index=False)
+        os.replace(path + ".tmp", path)
+    meta = {"periods": periods, "location": {"latitude": LAT, "longitude": LON},
+            "window_days": WINDOW_DAYS, "lux_per_wm2": LUX_PER_WM2, "built": datetime.utcnow().strftime("%Y-%m-%d"),
+            "sources": {"t": "era5_land", "rh": "era5_land", "p": "era5", "ws": "era5", "lux": "era5",
+                        "uv": "CAMS global atmospheric composition forecasts, 00 UTC run, hours 1-24"},
+            "grid_cells": cells, "units": {"t": "°C", "rh": "%", "p": "hPa (sea level)", "ws": "m/s (10 m)",
+                                            "lux": "lux (station sensor scale)", "uv": "UV index"}}
+    meta["sources"] = {k: v for k, v in meta["sources"].items() if k in stats}
+    path = os.path.join(OUT_DIR, "kalamaria_meta.json")
+    with open(path + ".tmp", "w") as f:
+        json.dump(meta, f, indent=1, ensure_ascii=False)
+    os.replace(path + ".tmp", path)
+    print(f"  {datetime.now():%H:%M} written to {OUT_DIR}: {', '.join(stats)}", flush=True)
 
 
 def main():
@@ -277,37 +347,33 @@ def main():
     missing = df[VARS].isna().mean()
     print("missing share:", missing.round(4).to_dict())
 
-    series = {v: (df[v], FIRST_YEAR, LAST_YEAR) for v in VARS}
+    stats = {v: calendar_stats(df[v], FIRST_YEAR, LAST_YEAR) for v in VARS}
     periods = {v: f"{FIRST_YEAR}-{LAST_YEAR}" for v in VARS}
-    if not skip_uv:
-        uv = uv_series()
-        if uv is not None:
-            series["uv"] = (uv, UV_FIRST_YEAR, UV_LAST_YEAR)
-            periods["uv"] = f"{UV_FIRST_YEAR}-{UV_LAST_YEAR}"
-            cells["cams_forecasts"] = {"area": UV_AREA, "interpolated_to": [LAT, LON]}
+    if skip_uv:
+        write_tables(stats, periods, cells)
+        return
 
-    hourly = {"doy": np.repeat(np.arange(1, 367), 24), "hour": np.tile(np.arange(24), 366)}
-    daily = {"doy": np.arange(1, 367)}
-    for v, (s, first, last) in series.items():
-        hourly_stats, daily_stats = calendar_stats(s, first, last)
-        for name, h, d in zip(("mean", "p10", "p90"), hourly_stats, daily_stats):
-            hourly[f"{v}_{name}"] = h.reshape(-1).round(DECIMALS[v])
-            daily[f"{v}_{name}"] = d.round(DECIMALS[v])
-        print(f"{v}: done")
+    written = []   # the UV years of the tables written so far
 
-    os.makedirs(OUT_DIR, exist_ok=True)
-    pd.DataFrame(hourly).to_csv(os.path.join(OUT_DIR, "kalamaria_hourly.csv"), index=False)
-    pd.DataFrame(daily).to_csv(os.path.join(OUT_DIR, "kalamaria_daily.csv"), index=False)
-    meta = {"periods": periods, "location": {"latitude": LAT, "longitude": LON},
-            "window_days": WINDOW_DAYS, "lux_per_wm2": LUX_PER_WM2, "built": datetime.utcnow().strftime("%Y-%m-%d"),
-            "sources": {"t": "era5_land", "rh": "era5_land", "p": "era5", "ws": "era5", "lux": "era5",
-                        "uv": "CAMS global atmospheric composition forecasts, 00 UTC run, hours 1-24"},
-            "grid_cells": cells, "units": {"t": "°C", "rh": "%", "p": "hPa (sea level)", "ws": "m/s (10 m)",
-                                            "lux": "lux (station sensor scale)", "uv": "UV index"}}
-    meta["sources"] = {k: v for k, v in meta["sources"].items() if k in series}
-    with open(os.path.join(OUT_DIR, "kalamaria_meta.json"), "w") as f:
-        json.dump(meta, f, indent=1, ensure_ascii=False)
-    print("written to", OUT_DIR)
+    def update_uv(left_out):
+        """(Re)writes the tables with the UV normal once UV_MIN_YEARS years are in, and again as each year adds."""
+        years = uv_block(left_out)
+        if len(years) < UV_MIN_YEARS or (written and years == written[-1]):
+            return
+        uv = uv_series(years)
+        if uv is None:
+            return
+        first, last = years[0], years[-1]
+        gaps = [str(y) for y in range(first, last + 1) if y not in years]   # left out: absent from the statistics
+        write_tables(dict(stats, uv=calendar_stats(uv, first, last)),
+                     dict(periods, uv=f"{first}-{last}" + (f" without {', '.join(gaps)}" if gaps else "")),
+                     dict(cells, cams_forecasts={"area": UV_AREA, "interpolated_to": [LAT, LON]}))
+        written.append(years)
+
+    left_out = download_uv(update_uv)
+    if not written:
+        print(f"CAMS UV: fewer than {UV_MIN_YEARS} years in a row (left out: {left_out}), so no UV normal")
+        write_tables(stats, periods, cells)
 
 
 if __name__ == "__main__":

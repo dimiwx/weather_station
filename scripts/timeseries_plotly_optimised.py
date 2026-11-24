@@ -1,4 +1,4 @@
-import os, glob, gzip, io, math, sqlite3, threading, time, urllib.parse
+import os, glob, gzip, io, json, math, re, sqlite3, threading, time, urllib.parse
 from functools import lru_cache
 from dotenv import load_dotenv
 
@@ -442,8 +442,7 @@ def add_line(fig, s, name, color, unit, decimals=1, **kwargs):
 # ----------------------------------------------------------------------------
 SHOW_CLIMATOLOGY = True
 CLIM_DIR = os.path.join(BASE_DIR, "climatology")
-CLIM_PERIOD = "1991–2020"
-CLIM_PERIODS = {"uv": "2016–2025"}   # where a variable's normal covers other years
+CLIM_PERIOD = "1991–2020"   # unless kalamaria_meta.json's "periods" gives a variable other years (UV)
 CLIM_SOURCES = {"t": "ERA5-Land", "rh": "ERA5-Land", "p": "ERA5, sea level", "ws": "ERA5, 10 m",
                 "lux": "ERA5 sunlight × 60 lux per W/m²", "uv": "CAMS forecasts"}
 CLIM_LINE = dict(color="rgba(80, 80, 80, 0.8)", width=1.6, dash="dash")
@@ -472,6 +471,21 @@ def climatology_tables():
     except Exception as e:
         print(f"Climatology unavailable: {type(e).__name__}: {e}")
         return {}
+
+
+@lru_cache(maxsize=1)
+def _climatology_periods(mtime):
+    with open(os.path.join(CLIM_DIR, "kalamaria_meta.json")) as f:
+        return json.load(f).get("periods", {})
+
+
+def climatology_period(var):
+    """The years of a variable's normal, e.g. "1991–2020", or for UV "2016–2025" ("… without 2019" if left out)."""
+    try:
+        p = _climatology_periods(os.path.getmtime(os.path.join(CLIM_DIR, "kalamaria_meta.json"))).get(var)
+    except Exception:
+        p = None
+    return re.sub(r"(\d{4})-(\d{4})", r"\1–\2", p) if p else CLIM_PERIOD
 
 
 def _leap_doy0(idx):
@@ -531,9 +545,11 @@ def climatology_note(b):
            "as its daily mean, with the range of 80 % of the hourly values through the day (from the lowest 10th "
            "to the highest 90th percentile)" if b < 86400 else
            "as daily means, with the range of 80 % of the daily means (10th to 90th percentile)")
-    return (f" Grey: the normal for Kalamaria (dashed), {how}. {CLIM_PERIOD}: temperature and humidity from "
-            "ERA5-Land; sea-level pressure, 10 m wind and light from ERA5 (light: sunlight × 60 lux per W/m², "
-            f"this sensor's ratio). UV index: {CLIM_PERIODS['uv']}, from CAMS's daily forecasts (its first day).")
+    uv = (f" UV index: {climatology_period('uv')}, from CAMS's daily forecasts (their first day)."
+          if "uv" in climatology_tables() else "")
+    return (f" Grey: the normal for Kalamaria (dashed), {how}. {climatology_period('t')}: temperature and humidity "
+            "from ERA5-Land; sea-level pressure, 10 m wind and light from ERA5 (light: sunlight × 60 lux per W/m², "
+            f"this sensor's ratio).{uv}")
 
 
 def add_climatology(fig, var, unit, decimals=1, c=None, row=None, col=None, showlegend=True):
@@ -547,7 +563,7 @@ def add_climatology(fig, var, unit, decimals=1, c=None, row=None, col=None, show
         return None
     n = len(fig.data)
     where = dict(row=row, col=col) if row else {}
-    name = f"Normal {CLIM_PERIODS.get(var, CLIM_PERIOD)}"
+    name = f"Normal {climatology_period(var)}"
     rng = c[["p10", "p90"]].round(decimals).values
     fig.add_trace(go.Scatter(x=c.index, y=c["p90"].round(decimals).values, mode="lines", line=dict(width=0),
                              hoverinfo="skip", showlegend=False, legendgroup="clim"), **where)
